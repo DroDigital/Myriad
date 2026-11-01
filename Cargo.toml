@@ -1,0 +1,25 @@
+[package]
+name = "myriad"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+description = "A survivors-like turned inside out: you are the horde."
+
+[dependencies]
+anyhow = "1"
+bytemuck = { version = "1.25", features = ["derive"] }
+env_logger = "0.11"
+glam = { version = "0.34", features = ["bytemuck"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+log = "0.4"
+pollster = "0.4"
+wgpu = "30.0.1"
+winit = "0.30.13"
+
+# wgpu/naga are slow unoptimised; keep our own crate quick to rebuild.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
