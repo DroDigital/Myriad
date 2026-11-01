@@ -29,7 +29,7 @@ jobs:
         env:
           MYRIAD_REQUIRE_GPU: "1"
       - name: Headless smoke run
-        run: cargo run -- --headless --agents 20000 --frames 300 --screenshot target/smoke.png
+        run: cargo run -- --headless --frames 1800 --screenshot target/smoke.png && cargo run -- --headless --agents 20000 --frames 120
       - uses: actions/upload-artifact@v4
         with:
           name: smoke-screenshot

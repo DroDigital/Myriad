@@ -13,16 +13,21 @@ use winit::window::{Window, WindowId};
 
 use crate::game::Controls;
 use crate::gpu::Gpu;
+use crate::run::RunConfig;
 use crate::session::{Session, SessionConfig};
 
-/// Critters added per press of the hatch key (H).
-const HATCH_BATCH: u32 = 1_000;
+/// Mass granted per press of the developer key (H, with --dev).
+const DEV_GRANT: f64 = 100.0;
 
 #[derive(Clone, Debug)]
 pub struct AppOptions {
     pub agents: u32,
     pub capacity: u32,
     pub seed: u64,
+    /// Enables developer keys.
+    pub dev: bool,
+    /// Include the mop hazard.
+    pub hazard: bool,
 }
 
 pub fn run(opts: AppOptions) -> Result<()> {
@@ -68,7 +73,7 @@ impl Input {
     fn controls(&self, session: &Session, viewport: Vec2) -> Controls {
         let axis = |neg: bool, pos: bool| (pos as i32 - neg as i32) as f32;
         let pointer = match (self.mouse_down, self.mouse_px) {
-            (true, Some(px)) => Some(session.game.camera.screen_to_world(px, viewport)),
+            (true, Some(px)) => Some(session.run.game.camera.screen_to_world(px, viewport)),
             _ => None,
         };
         Controls {
@@ -86,6 +91,7 @@ struct Running {
     gpu: Gpu,
     session: Session,
     input: Input,
+    dev: bool,
     last_frame: Instant,
     fps_window_start: Instant,
     fps_frames: u32,
@@ -117,10 +123,12 @@ impl Running {
         surface.configure(&gpu.device, &config);
 
         let cfg = SessionConfig {
-            initial_agents: opts.agents,
-            capacity: opts.capacity.max(opts.agents),
+            run: RunConfig {
+                initial_critters: opts.agents,
+                capacity: opts.capacity.max(opts.agents),
+                hazard_delay: opts.hazard.then_some(30.0),
+            },
             seed: opts.seed,
-            ..Default::default()
         };
         let aspect = config.width as f32 / config.height as f32;
         let session = Session::new(&gpu, config.format, aspect, &cfg);
@@ -132,6 +140,7 @@ impl Running {
             gpu,
             session,
             input: Input::default(),
+            dev: opts.dev,
             last_frame: now,
             fps_window_start: now,
             fps_frames: 0,
@@ -145,7 +154,7 @@ impl Running {
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.gpu.device, &self.config);
-        self.session.game.camera.aspect = width as f32 / height as f32;
+        self.session.run.game.camera.aspect = width as f32 / height as f32;
     }
 
     fn frame(&mut self) {
@@ -173,7 +182,8 @@ impl Running {
         let view = texture
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        self.session.draw(&self.gpu, &view, self.config.height);
+        self.session
+            .draw(&self.gpu, &view, self.config.width, self.config.height);
         self.window.pre_present_notify();
         self.gpu.queue.present(texture);
 
@@ -182,8 +192,8 @@ impl Running {
         if elapsed >= 0.5 {
             let fps = self.fps_frames as f32 / elapsed;
             self.window.set_title(&format!(
-                "Myriad | {} critters | {fps:.0} fps | WASD/mouse steer, Space gather, Shift spread, H hatch",
-                self.session.swarm.count()
+                "Myriad | mass {} | {fps:.0} fps | WASD/mouse steer, Space gather, Shift spread, R restart",
+                self.session.run.colony.mass()
             ));
             self.fps_window_start = now;
             self.fps_frames = 0;
@@ -223,8 +233,10 @@ impl ApplicationHandler for App {
                     let pressed = event.state == ElementState::Pressed;
                     if code == KeyCode::Escape && pressed {
                         event_loop.exit();
-                    } else if code == KeyCode::KeyH && pressed && !event.repeat {
-                        r.session.hatch(&r.gpu, HATCH_BATCH);
+                    } else if code == KeyCode::KeyR && pressed && !event.repeat {
+                        r.session.restart(&r.gpu);
+                    } else if code == KeyCode::KeyH && pressed && !event.repeat && r.dev {
+                        r.session.grant(DEV_GRANT);
                     } else {
                         r.input.key(code, pressed);
                     }
