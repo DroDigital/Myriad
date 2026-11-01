@@ -22,6 +22,9 @@ pub const FLAG_BLOCKED: u32 = 1;
 pub const FLAG_SOLID: u32 = 2;
 /// Can be eaten.
 pub const FLAG_EDIBLE: u32 = 4;
+/// Open water: blocks movement unless held up by anchored critters (a bridge).
+/// For water cells the amount is that step's count of anchored critters.
+pub const FLAG_WATER: u32 = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
@@ -33,6 +36,7 @@ pub enum Kind {
     Cereal = 4,
     Jam = 5,
     Cheese = 6,
+    Water = 7,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -45,7 +49,7 @@ pub struct KindInfo {
     pub color: [f32; 3],
 }
 
-pub const KINDS: [KindInfo; 7] = [
+pub const KINDS: [KindInfo; 8] = [
     KindInfo {
         kind: Kind::Floor,
         flags: 0,
@@ -88,6 +92,12 @@ pub const KINDS: [KindInfo; 7] = [
         eat_rate: 0.8,
         color: [0.98, 0.80, 0.30],
     },
+    KindInfo {
+        kind: Kind::Water,
+        flags: FLAG_WATER,
+        eat_rate: 0.0,
+        color: [0.50, 0.70, 0.88],
+    },
 ];
 
 impl Kind {
@@ -115,6 +125,7 @@ pub fn wgsl_kind_table() -> String {
          const FLAG_BLOCKED: u32 = {FLAG_BLOCKED}u;\n\
          const FLAG_SOLID: u32 = {FLAG_SOLID}u;\n\
          const FLAG_EDIBLE: u32 = {FLAG_EDIBLE}u;\n\
+         const FLAG_WATER: u32 = {FLAG_WATER}u;\n\
          const KIND_COUNT: u32 = {n}u;\n\
          const KIND_FLAGS = array<u32, {n}>({});\n\
          const KIND_RATE = array<f32, {n}>({});\n\
@@ -186,6 +197,12 @@ impl MaterialLayout {
                 self.amounts[i] = amount;
             }
         }
+    }
+
+    /// Whether a position is open water (ignores bridges).
+    pub fn is_water(&self, p: Vec2) -> bool {
+        self.index_of(p)
+            .is_some_and(|i| KINDS[self.kinds[i] as usize].flags & FLAG_WATER != 0)
     }
 
     /// Whether a position is permanently blocked (walls; ignores food).

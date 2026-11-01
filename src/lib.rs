@@ -7,6 +7,7 @@ pub mod app;
 pub mod camera;
 pub mod cli;
 pub mod colony;
+pub mod forms;
 pub mod game;
 pub mod gpu;
 pub mod hazard;

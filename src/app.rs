@@ -44,7 +44,8 @@ pub fn run(opts: AppOptions) -> Result<()> {
     }
 }
 
-/// Raw input state, turned into [`Controls`] each frame.
+/// Raw input state from keyboard, mouse and gamepad, turned into
+/// [`Controls`] each frame.
 #[derive(Default)]
 struct Input {
     up: bool,
@@ -53,12 +54,30 @@ struct Input {
     right: bool,
     gather: bool,
     spread: bool,
+    build_key: bool,
     mouse_px: Option<Vec2>,
     mouse_down: bool,
+    /// Presses waiting to be consumed by a simulation step.
+    form: [bool; 2],
+    cycle: [bool; 2],
+    pad: PadState,
 }
 
+/// Gamepad state (gilrs): left stick steers, triggers Gather/Spread,
+/// A/B fire the Form slots, X holds Build, bumpers cycle the slots.
+#[derive(Default)]
+struct PadState {
+    stick: Vec2,
+    gather: f32,
+    spread: f32,
+    build: bool,
+}
+
+const STICK_DEADZONE: f32 = 0.2;
+
 impl Input {
-    fn key(&mut self, code: KeyCode, pressed: bool) {
+    fn key(&mut self, code: KeyCode, pressed: bool, repeat: bool) {
+        let fresh = pressed && !repeat;
         match code {
             KeyCode::KeyW | KeyCode::ArrowUp => self.up = pressed,
             KeyCode::KeyS | KeyCode::ArrowDown => self.down = pressed,
@@ -66,21 +85,70 @@ impl Input {
             KeyCode::KeyD | KeyCode::ArrowRight => self.right = pressed,
             KeyCode::Space => self.gather = pressed,
             KeyCode::ShiftLeft | KeyCode::ShiftRight => self.spread = pressed,
+            KeyCode::KeyB | KeyCode::KeyL => self.build_key = pressed,
+            KeyCode::KeyZ | KeyCode::KeyJ => self.form[0] |= fresh,
+            KeyCode::KeyX | KeyCode::KeyK => self.form[1] |= fresh,
+            KeyCode::KeyQ => self.cycle[0] |= fresh,
+            KeyCode::KeyE => self.cycle[1] |= fresh,
             _ => {}
+        }
+    }
+
+    fn gamepad(&mut self, gilrs: &mut gilrs::Gilrs) {
+        use gilrs::{Axis, Button, EventType};
+        while let Some(ev) = gilrs.next_event() {
+            match ev.event {
+                EventType::ButtonPressed(b, _) => match b {
+                    Button::South => self.form[0] = true,
+                    Button::East => self.form[1] = true,
+                    Button::West => self.pad.build = true,
+                    Button::LeftTrigger => self.cycle[0] = true,
+                    Button::RightTrigger => self.cycle[1] = true,
+                    _ => {}
+                },
+                EventType::ButtonReleased(Button::West, _) => self.pad.build = false,
+                EventType::ButtonChanged(Button::RightTrigger2, v, _) => self.pad.gather = v,
+                EventType::ButtonChanged(Button::LeftTrigger2, v, _) => self.pad.spread = v,
+                EventType::AxisChanged(Axis::LeftStickX, v, _) => self.pad.stick.x = v,
+                EventType::AxisChanged(Axis::LeftStickY, v, _) => self.pad.stick.y = v,
+                EventType::Disconnected => self.pad = PadState::default(),
+                _ => {}
+            }
         }
     }
 
     fn controls(&self, session: &Session, viewport: Vec2) -> Controls {
         let axis = |neg: bool, pos: bool| (pos as i32 - neg as i32) as f32;
-        let pointer = match (self.mouse_down, self.mouse_px) {
-            (true, Some(px)) => Some(session.run.game.camera.screen_to_world(px, viewport)),
-            _ => None,
+        let cursor = self
+            .mouse_px
+            .map(|px| session.run.game.camera.screen_to_world(px, viewport));
+        let stick = if self.pad.stick.length() > STICK_DEADZONE {
+            self.pad.stick
+        } else {
+            Vec2::ZERO
         };
+        let keys = Vec2::new(axis(self.left, self.right), axis(self.down, self.up));
         Controls {
-            move_dir: Vec2::new(axis(self.left, self.right), axis(self.down, self.up)),
-            gather: axis(self.spread, self.gather),
-            pointer,
+            move_dir: keys + stick,
+            gather: (axis(self.spread, self.gather) + self.pad.gather - self.pad.spread)
+                .clamp(-1.0, 1.0),
+            pointer: cursor.filter(|_| self.mouse_down),
+            form: self.form,
+            cycle: self.cycle,
+            build: self.build_key || self.pad.build,
+            // Aim with the stick if it is pushed, else at the cursor.
+            aim: if stick != Vec2::ZERO {
+                session.run.game.swarm_center.map(|c| c + stick * 10.0)
+            } else {
+                cursor
+            },
         }
+    }
+
+    /// Clears presses once a simulation step has consumed them.
+    fn consume_presses(&mut self) {
+        self.form = [false; 2];
+        self.cycle = [false; 2];
     }
 }
 
@@ -91,6 +159,8 @@ struct Running {
     gpu: Gpu,
     session: Session,
     input: Input,
+    /// Gamepad support; `None` if gilrs could not start (e.g. no udev).
+    gilrs: Option<gilrs::Gilrs>,
     dev: bool,
     last_frame: Instant,
     fps_window_start: Instant,
@@ -140,6 +210,9 @@ impl Running {
             gpu,
             session,
             input: Input::default(),
+            gilrs: gilrs::Gilrs::new()
+                .inspect_err(|e| log::warn!("gamepads unavailable: {e}"))
+                .ok(),
             dev: opts.dev,
             last_frame: now,
             fps_window_start: now,
@@ -163,8 +236,13 @@ impl Running {
         self.last_frame = now;
 
         let viewport = Vec2::new(self.config.width as f32, self.config.height as f32);
+        if let Some(gilrs) = &mut self.gilrs {
+            self.input.gamepad(gilrs);
+        }
         let controls = self.input.controls(&self.session, viewport);
-        self.session.advance(&self.gpu, &controls, dt);
+        if self.session.advance(&self.gpu, &controls, dt) > 0 {
+            self.input.consume_presses();
+        }
 
         let texture = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
@@ -192,7 +270,7 @@ impl Running {
         if elapsed >= 0.5 {
             let fps = self.fps_frames as f32 / elapsed;
             self.window.set_title(&format!(
-                "Myriad | mass {} | {fps:.0} fps | WASD/mouse steer, Space gather, Shift spread, R restart",
+                "Myriad | mass {} | {fps:.0} fps | WASD/mouse steer, Space gather, Shift spread, Z/X Forms, B build, R restart",
                 self.session.run.colony.mass()
             ));
             self.fps_window_start = now;
@@ -238,7 +316,7 @@ impl ApplicationHandler for App {
                     } else if code == KeyCode::KeyH && pressed && !event.repeat && r.dev {
                         r.session.grant(DEV_GRANT);
                     } else {
-                        r.input.key(code, pressed);
+                        r.input.key(code, pressed, event.repeat);
                     }
                 }
             }

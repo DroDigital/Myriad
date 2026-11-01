@@ -107,6 +107,9 @@ fn coverage(c: vec2i, k: u32) -> f32 {
         return 1.0;
     }
     let amount = mat_amount[i];
+    if ((flags & FLAG_WATER) != 0u) {
+        return 1.0;
+    }
     if ((flags & FLAG_SOLID) != 0u) {
         return select(0.0, 1.0, amount > 0u);
     }
@@ -138,6 +141,10 @@ fn draw_material(w: vec2f, px: f32, base: vec3f) -> vec3f {
         // Cupboards and table legs: wood with a darker rim.
         let grain = 0.92 + 0.08 * sin(w.y * 3.0 + sin(w.x * 0.7) * 2.0);
         food *= grain * mix(0.7, 1.0, smoothstep(0.5, 0.95, cov));
+    } else if ((flags & FLAG_WATER) != 0u) {
+        // Spilled water: a soft ripple, darker at the edges.
+        let ripple = 0.5 + 0.5 * sin(w.x * 1.7 + cam.time * 1.3) * sin(w.y * 1.9 - cam.time);
+        food *= mix(0.85, 1.08, ripple) * mix(0.8, 1.0, smoothstep(0.5, 0.95, cov));
     } else if ((flags & FLAG_SOLID) != 0u) {
         // Solid food keeps its shape until a cell is gone; gnawed cells darken.
         let fullness = min(f32(mat_amount[mat_index(here)]) / f32(FULL), 1.0);

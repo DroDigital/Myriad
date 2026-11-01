@@ -5,11 +5,11 @@ A survivors-like turned inside out: you are the horde. Hatch from ten critters o
 - **Design:** [docs/design/myriad-synthesis.md](docs/design/myriad-synthesis.md), the combined concept.
 - **Build plan:** [docs/ROADMAP.md](docs/ROADMAP.md), the major steps, their status, and prompts for continuing in a new session.
 
-![Three minutes in: the swarm devouring a jam spill](docs/media/step2-kitchen-3min.png)
+![Building a bridge across the water to reach the cheese](docs/media/step3-bridge.png)
 
 ## Run it
 
-You need Rust 1.88 or newer, plus a GPU with Vulkan, Metal or DirectX 12.
+You need Rust 1.88 or newer, plus a GPU with Vulkan, Metal or DirectX 12. On Linux, gamepad support also needs `libudev-dev`.
 
 ```bash
 cargo run --release
@@ -21,10 +21,13 @@ cargo run --release
 | Left mouse (hold) | Steer toward the cursor |
 | Space | Gather (tighten) |
 | Shift | Spread (loosen) |
+| Z / X | Fire Form slot 1 / 2 (Spear and Shield to start) |
+| Q / E | Cycle the Form in slot 1 / 2 (Spear, Shield, Ring, Comet, Bloom) |
+| B (hold) | Build: critters bridge water; let go and the bridge drops |
 | R | Restart |
 | Esc | Quit |
 
-Eat food to gain mass, and new critters hatch around the Queen. Keep her guarded: if she falls, the run ends. Watch for the mop.
+Eat food to gain mass, and new critters hatch around the Queen. Keep her guarded: if she falls, the run ends. Watch for the mop. Forms cost mass: a Spear bores through tough food, and a Shield turtles around the Queen. A gamepad works too: the stick steers, the triggers Gather and Spread, A and B fire the Forms, X builds, and the bumpers cycle Forms.
 
 Options: `--agents N`, `--capacity N`, `--seed N`, `--no-hazard` and `--dev` (H grants +100 mass). Run `cargo run -- --help` for the full list.
 
@@ -58,6 +61,7 @@ GPU tests skip themselves when no adapter is found. Set `MYRIAD_REQUIRE_GPU=1` (
 | `src/run.rs` | One run's rules: Queen, mop, mass economy, win/lose (pure CPU) |
 | `src/game.rs` | Focal point, Gather/Spread, leash, camera targeting |
 | `src/colony.rs`, `src/queen.rs`, `src/hazard.rs` | Mass economy, the Queen, the mop |
+| `src/forms.rs` | Forms: costs, durations, cooldowns, slots |
 | `src/hud.rs` | HUD layout |
 | `src/session.rs` | Fixed-timestep loop tying the GPU and the rules together |
 | `src/app.rs` | winit window, input mapping, presentation |

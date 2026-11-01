@@ -30,6 +30,13 @@ use material::MaterialGrid;
 
 pub const WORKGROUP_SIZE: u32 = 256;
 pub const AGENT_ALIVE: u32 = 1;
+/// Holding up a bridge over water (only while Build is held).
+pub const AGENT_ANCHORED: u32 = 2;
+/// Flow-field relaxation sweeps per step. The field's wavefront moves this
+/// many cells per step, so it crosses the kitchen in well under a second.
+pub const FLOW_SWEEPS: u32 = 6;
+/// Path distance meaning "unreached or unreachable".
+pub const FLOW_INF: f32 = 1e9;
 pub const INVALID_CELL: u32 = u32::MAX;
 
 /// Indices into the GPU `counters` buffer. Must match `common.wgsl`.
@@ -39,6 +46,8 @@ pub mod counter {
     pub const EATEN: usize = 2;
     pub const DIED: usize = 3;
     pub const TICKETS: usize = 4;
+    pub const SACRIFICED: usize = 5;
+    pub const SAC_TICKETS: usize = 6;
     pub const COUNT: usize = 8;
 }
 
@@ -125,7 +134,16 @@ pub struct SimParams {
     pub forage_strength: f32,
     pub forage_radius: f32,
     pub body_radius: f32,
-    pub _pad: f32,
+    pub solid_cost: f32,
+    pub form_origin: [f32; 2],
+    pub form_dir: [f32; 2],
+    pub form_kind: u32,
+    pub form_t: f32,
+    pub form_size: f32,
+    pub build_active: u32,
+    pub sacrifice: u32,
+    pub drown_rate: f32,
+    pub _pad: [f32; 2],
 }
 
 /// Feel knobs for the swarm. Tweaked by Gather/Spread each step.
@@ -155,6 +173,11 @@ pub struct SwarmTuning {
     pub forage_strength: f32,
     /// How far critters sense food, in world units.
     pub forage_radius: f32,
+    /// Path cost of chewing through a cell of solid food, relative to walking
+    /// across an open one.
+    pub solid_cost: f32,
+    /// Chance per step that a critter on open water drowns.
+    pub drown_rate: f32,
 }
 
 impl Default for SwarmTuning {
@@ -175,6 +198,8 @@ impl Default for SwarmTuning {
             guard_radius: 4.0,
             forage_strength: 14.0,
             forage_radius: 3.0,
+            solid_cost: 12.0,
+            drown_rate: 0.02,
         }
     }
 }
@@ -203,6 +228,19 @@ pub struct HazardZone {
     pub radius: f32,
 }
 
+/// The Form the swarm is holding this step (see `crate::forms`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FormShape {
+    /// `FormKind as u32`.
+    pub kind: u32,
+    pub origin: Vec2,
+    /// Unit aim direction.
+    pub dir: Vec2,
+    pub size: f32,
+    /// Progress 0..1.
+    pub t: f32,
+}
+
 /// Per-step inputs from gameplay.
 #[derive(Clone, Copy, Debug)]
 pub struct SimFrame {
@@ -217,6 +255,11 @@ pub struct SimFrame {
     /// The Queen's body: critters keep out of it; hatchlings appear around it.
     pub queen_radius: f32,
     pub hazard: Option<HazardZone>,
+    pub form: Option<FormShape>,
+    /// Build held: critters bumping into open water anchor and become a bridge.
+    pub build: bool,
+    /// Critters to give up this step (mass spent beyond the bank).
+    pub sacrifice: u32,
 }
 
 impl SimFrame {
@@ -231,6 +274,9 @@ impl SimFrame {
             queen_pos: Vec2::splat(f32::MAX),
             queen_radius: 1.0,
             hazard: None,
+            form: None,
+            build: false,
+            sacrifice: 0,
         }
     }
 }
@@ -261,9 +307,11 @@ struct Pass {
 struct Passes {
     hatch_revive: Pass,
     hatch_append: Pass,
+    water_reset: Pass,
     count: Pass,
     scan: Pass,
     scatter: Pass,
+    flow: Pass,
     steer: Pass,
     reduce: Pass,
 }
@@ -281,8 +329,9 @@ pub struct Swarm {
     params: wgpu::Buffer,
     agents: wgpu::Buffer,
     agents_next: wgpu::Buffer,
-    counts: wgpu::Buffer,
-    starts: wgpu::Buffer,
+    /// Per-cell counts, then per-cell start offsets.
+    grid: wgpu::Buffer,
+    flow: wgpu::Buffer,
     agent_cell: wgpu::Buffer,
     sorted: wgpu::Buffer,
     counters: wgpu::Buffer,
@@ -328,8 +377,13 @@ impl Swarm {
         });
         let agents = storage("agents", agent_bytes);
         let agents_next = storage("agents next", agent_bytes);
-        let counts = storage("cell counts", cell_count as u64 * 4);
-        let starts = storage("cell starts", cell_count as u64 * 4);
+        let grid = storage("cell counts and starts", cell_count as u64 * 8);
+        let flow = storage("flow field", cell_count as u64 * 4);
+        gpu.queue.write_buffer(
+            &flow,
+            0,
+            bytemuck::cast_slice(&vec![FLOW_INF; cell_count as usize]),
+        );
         let agent_cell = storage("agent cell", cap * 4);
         let agent_local = storage("agent local", cap * 4);
         let sorted = storage("sorted agents", cap * 4);
@@ -341,28 +395,37 @@ impl Swarm {
         let passes = Passes {
             hatch_revive: mp("hatch_revive", &[&params, &agents, &counters]),
             hatch_append: mp("hatch_append", &[&params, &agents, &counters]),
+            water_reset: mp(
+                "water_reset",
+                &[&params, &material.amounts, &material.kinds],
+            ),
             count: mp(
                 "count",
                 &[
                     &params,
                     &agents,
-                    &counts,
+                    &grid,
                     &agent_cell,
                     &agent_local,
                     &counters,
+                    &material.amounts,
                 ],
             ),
-            scan: mp("scan", &[&params, &counts, &starts]),
+            scan: mp("scan", &[&params, &grid]),
             scatter: mp(
                 "scatter",
                 &[
                     &params,
                     &agent_cell,
                     &agent_local,
-                    &starts,
+                    &grid,
                     &sorted,
                     &counters,
                 ],
+            ),
+            flow: mp(
+                "flow",
+                &[&params, &flow, &material.amounts, &material.kinds],
             ),
             steer: mp(
                 "steer",
@@ -370,12 +433,12 @@ impl Swarm {
                     &params,
                     &agents,
                     &agents_next,
-                    &counts,
-                    &starts,
+                    &grid,
                     &sorted,
                     &counters,
                     &material.amounts,
                     &material.kinds,
+                    &flow,
                 ],
             ),
             reduce: mp("reduce", &[&params, &agents, &partials, &counters]),
@@ -393,8 +456,8 @@ impl Swarm {
             params,
             agents,
             agents_next,
-            counts,
-            starts,
+            grid,
+            flow,
             agent_cell,
             sorted,
             counters,
@@ -486,7 +549,15 @@ impl Swarm {
                 .max(rest_radius(self.alive_hint, t.rest_density) * 0.8),
             pressure_strength: t.pressure_strength,
             // Gather packs critters tighter; Spread loosens them.
-            rest_density: t.rest_density * (1.0 + 1.5 * gather) * (1.0 - 0.6 * spread),
+            rest_density: t.rest_density
+                * (1.0 + 1.5 * gather)
+                * (1.0 - 0.6 * spread)
+                // Shapes pack the swarm tight (Spear, Shield, Ring).
+                * if frame.form.is_some_and(|f| (1..=3).contains(&f.kind)) {
+                    2.0
+                } else {
+                    1.0
+                },
             eat_rate: t.eat_rate,
             hatch_count: frame.hatch,
             queen_pos: frame.queen_pos.to_array(),
@@ -501,7 +572,16 @@ impl Swarm {
             forage_strength: t.forage_strength,
             forage_radius: t.forage_radius,
             body_radius: rest_radius(self.alive_hint, t.rest_density) * 2.0 + 8.0,
-            _pad: 0.0,
+            solid_cost: t.solid_cost,
+            form_origin: frame.form.map_or([0.0; 2], |f| f.origin.to_array()),
+            form_dir: frame.form.map_or([1.0, 0.0], |f| f.dir.to_array()),
+            form_kind: frame.form.map_or(0, |f| f.kind),
+            form_t: frame.form.map_or(0.0, |f| f.t),
+            form_size: frame.form.map_or(0.0, |f| f.size),
+            build_active: frame.build as u32,
+            sacrifice: frame.sacrifice,
+            drown_rate: t.drown_rate,
+            _pad: [0.0; 2],
         }
     }
 
@@ -543,9 +623,15 @@ impl Swarm {
 
     fn encode_step(&self, encoder: &mut wgpu::CommandEncoder, hatch: u32) {
         let groups = self.config.capacity.div_ceil(WORKGROUP_SIZE);
+        // Per-step ticket counters (TICKETS and SAC_TICKETS) start at zero.
         let tickets = (counter::TICKETS * 4) as u64;
         encoder.clear_buffer(&self.counters, tickets, Some(4));
-        encoder.clear_buffer(&self.counts, 0, None);
+        let sac = (counter::SAC_TICKETS * 4) as u64;
+        encoder.clear_buffer(&self.counters, sac, Some(4));
+        let cells = (self.grid_dim[0] * self.grid_dim[1]) as u64;
+        encoder.clear_buffer(&self.grid, 0, Some(cells * 4));
+        let mat_groups = (self.mat_dim[0] * self.mat_dim[1]).div_ceil(WORKGROUP_SIZE);
+        let cell_groups = (cells as u32).div_ceil(WORKGROUP_SIZE);
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("swarm"),
@@ -561,9 +647,13 @@ impl Swarm {
                 run(&p.hatch_revive, groups);
                 run(&p.hatch_append, hatch.div_ceil(WORKGROUP_SIZE));
             }
+            run(&p.water_reset, mat_groups);
             run(&p.count, groups);
             run(&p.scan, 1);
             run(&p.scatter, groups);
+            for _ in 0..FLOW_SWEEPS {
+                run(&p.flow, cell_groups);
+            }
             run(&p.steer, groups);
         }
         encoder.copy_buffer_to_buffer(&self.agents_next, 0, &self.agents, 0, None);
@@ -592,12 +682,20 @@ impl Swarm {
     pub fn read_grid(&self, gpu: &Gpu) -> anyhow::Result<GridSnapshot> {
         let cells = (self.grid_dim[0] * self.grid_dim[1]) as usize;
         let n = self.config.capacity as usize;
+        let mut grid: Vec<u32> = gpu.read_buffer(&self.grid, cells * 2)?;
+        let starts = grid.split_off(cells);
         Ok(GridSnapshot {
-            counts: gpu.read_buffer(&self.counts, cells)?,
-            starts: gpu.read_buffer(&self.starts, cells)?,
+            counts: grid,
+            starts,
             sorted: gpu.read_buffer(&self.sorted, n)?,
             agent_cell: gpu.read_buffer(&self.agent_cell, n)?,
         })
+    }
+
+    /// Reads the flow field back (blocking): path distance to the focal point
+    /// per grid cell, [`FLOW_INF`] where unreached. For tests and tools.
+    pub fn read_flow(&self, gpu: &Gpu) -> anyhow::Result<Vec<f32>> {
+        gpu.read_buffer(&self.flow, (self.grid_dim[0] * self.grid_dim[1]) as usize)
     }
 
     /// CPU mirror of the shader's cell lookup.
@@ -687,7 +785,7 @@ mod tests {
     #[test]
     fn gpu_struct_layouts_match_wgsl() {
         assert_eq!(size_of::<Agent>(), 32);
-        assert_eq!(size_of::<SimParams>(), 176);
+        assert_eq!(size_of::<SimParams>(), 224);
     }
 
     #[test]
@@ -695,9 +793,11 @@ mod tests {
         for name in [
             "hatch_revive",
             "hatch_append",
+            "water_reset",
             "count",
             "scan",
             "scatter",
+            "flow",
             "steer",
             "reduce",
         ] {
@@ -713,6 +813,8 @@ mod tests {
             ("EATEN", counter::EATEN),
             ("DIED", counter::DIED),
             ("TICKETS", counter::TICKETS),
+            ("SACRIFICED", counter::SACRIFICED),
+            ("SAC_TICKETS", counter::SAC_TICKETS),
         ] {
             let decl = format!("const {name}: u32 = {index}u;");
             assert!(COMMON_WGSL.contains(&decl), "missing `{decl}`");

@@ -96,8 +96,10 @@ impl Session {
     pub fn advance(&mut self, gpu: &Gpu, controls: &Controls, frame_dt: f32) -> u32 {
         self.accumulator += frame_dt.clamp(0.0, 0.25);
         let mut steps = 0;
+        let held = controls.held();
         while self.accumulator >= SIM_DT && steps < MAX_STEPS_PER_FRAME {
-            self.step(gpu, controls);
+            // Button presses fire on the first step of the frame only.
+            self.step(gpu, if steps == 0 { controls } else { &held });
             self.accumulator -= SIM_DT;
             steps += 1;
         }

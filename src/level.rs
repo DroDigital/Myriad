@@ -81,6 +81,7 @@ impl Level {
                     'b' => Kind::Bread,
                     'k' => Kind::Cereal,
                     'h' => Kind::Cheese,
+                    'w' => Kind::Water,
                     other => bail!("unknown map character `{other}` at row {row}, column {col}"),
                 };
                 match ch {
@@ -95,7 +96,7 @@ impl Level {
                         let i = ((cy0 + dy) * material.dim[0] + cx0 + dx) as usize;
                         material.kinds[i] = kind as u32;
                         material.amounts[i] = match kind {
-                            Kind::Floor | Kind::Wall => 0,
+                            Kind::Floor | Kind::Wall | Kind::Water => 0,
                             // Crumbs are sparse specks of varying size.
                             Kind::Crumbs => {
                                 if rng.next_f32() < 0.3 {

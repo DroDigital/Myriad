@@ -3,13 +3,18 @@
 //! consumes [`SwarmSummary`] feedback. No GPU code, so it is unit-testable.
 
 use crate::colony::Colony;
+use crate::forms::{FormKind, Forms};
 use crate::game::{Controls, Game};
 use crate::hazard::{MOP_QUEEN_DPS, Mop};
 use crate::level::Level;
 use crate::queen::{QUEEN_RADIUS, Queen, SPEED_FACTOR, guard_factor};
 use crate::sim::feedback::SwarmSummary;
 use crate::sim::material::MaterialLayout;
-use crate::sim::{SimFrame, rest_radius};
+use crate::sim::{FormShape, SimFrame, rest_radius};
+use glam::Vec2;
+
+/// Share of damage the Queen takes while the Shield is held.
+pub const SHIELD_DAMAGE_FACTOR: f32 = 0.15;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum RunState {
@@ -48,6 +53,9 @@ pub struct Run {
     pub guards: u32,
     /// Food in the level at the start, in full cells.
     pub food_total: f64,
+    pub forms: Forms,
+    /// Build is held this step.
+    pub building: bool,
     capacity: u32,
     walls: MaterialLayout,
 }
@@ -69,6 +77,8 @@ impl Run {
             guards: 0,
             food_total: level.material.total_food() as f64 / crate::sim::material::FULL as f64,
             capacity: cfg.capacity,
+            forms: Forms::default(),
+            building: false,
             walls: level.material.clone(),
         }
     }
@@ -113,11 +123,42 @@ impl Run {
             dt,
             |p| walls.is_wall(p),
         );
+        // Forms: cycle loadout, start one on a press, then hold it.
+        let mut sacrifice = 0;
+        if playing {
+            for slot in 0..2 {
+                if controls.cycle[slot] {
+                    self.forms.cycle(slot);
+                }
+                if controls.form[slot] {
+                    let aim = self.aim(controls);
+                    if let Ok(cost) = self.forms.try_activate(slot, self.colony.mass(), aim) {
+                        sacrifice += self.colony.spend(cost);
+                    }
+                }
+            }
+        }
+        self.forms.update(dt);
+        self.building = playing && controls.build;
+        let form = self.form_shape();
+        // Spear and Comet carry the swarm along their aim.
+        if let Some(f) = form
+            && (f.kind == FormKind::Spear as u32 || f.kind == FormKind::Comet as u32)
+        {
+            self.game.focal = (f.origin + f.dir * f.size.max(6.0))
+                .clamp(self.game.bounds.min, self.game.bounds.max);
+        }
+
         if let Some(mop) = &mut self.mop {
             mop.update(dt);
             if playing && mop.touches(self.queen.pos, QUEEN_RADIUS) {
+                let shield = if form.is_some_and(|f| f.kind == FormKind::Shield as u32) {
+                    SHIELD_DAMAGE_FACTOR
+                } else {
+                    1.0
+                };
                 self.queen
-                    .damage(MOP_QUEEN_DPS * guard_factor(self.guards) * dt);
+                    .damage(MOP_QUEEN_DPS * guard_factor(self.guards) * shield * dt);
             }
         }
         if playing && self.queen.is_dead() {
@@ -141,7 +182,45 @@ impl Run {
             queen_pos: self.queen.pos,
             queen_radius: QUEEN_RADIUS,
             hazard: self.mop.as_ref().and_then(Mop::zone),
+            form,
+            build: self.building,
+            sacrifice,
         }
+    }
+
+    /// Aim direction for a Form: toward the pointer, else along the stick,
+    /// else toward the focal point, else the way the Queen faces.
+    fn aim(&self, controls: &Controls) -> Vec2 {
+        let from = self.game.swarm_center.unwrap_or(self.game.focal);
+        controls
+            .aim
+            .map(|p| p - from)
+            .filter(|d| d.length_squared() > 1e-4)
+            .or_else(|| Some(controls.move_dir).filter(|d| d.length_squared() > 1e-4))
+            .or_else(|| Some(self.game.focal - from).filter(|d| d.length_squared() > 1.0))
+            .unwrap_or(self.queen.heading)
+            .normalize_or(Vec2::Y)
+    }
+
+    /// The active Form's shape for the GPU, if one is held.
+    pub fn form_shape(&self) -> Option<FormShape> {
+        let a = self.forms.active?;
+        let center = self.game.swarm_center.unwrap_or(self.game.focal);
+        let r = self.game.swarm_radius.max(2.0);
+        let (origin, size) = match a.kind {
+            FormKind::Spear => (center, (r * 3.0).max(8.0)),
+            // A shell around the Queen big enough for the whole swarm.
+            FormKind::Shield => (self.queen.pos, (QUEEN_RADIUS * 2.4).max(r * 0.7)),
+            FormKind::Ring => (center, r * 1.3 + 3.0),
+            FormKind::Comet | FormKind::Bloom => (center, r),
+        };
+        Some(FormShape {
+            kind: a.kind as u32,
+            origin,
+            dir: a.dir,
+            size,
+            t: a.t(),
+        })
     }
 }
 
@@ -196,6 +275,64 @@ mod tests {
         // No more hatching after death, even with food in the bank.
         r.colony.grant(100.0);
         assert_eq!(r.update(&Controls::default(), DT).hatch, 0);
+    }
+
+    #[test]
+    fn forms_cost_mass_and_shape_the_frame() {
+        let mut r = run(None);
+        r.colony.grant(90.0); // mass 100
+        let press = Controls {
+            form: [true, false],
+            aim: Some(r.queen.pos + Vec2::new(10.0, 0.0)),
+            ..Default::default()
+        };
+        let frame = r.update(&press, DT);
+        let shape = frame.form.expect("spear is active");
+        assert_eq!(shape.kind, FormKind::Spear as u32);
+        assert!(shape.dir.x > 0.99);
+        assert_eq!(
+            r.colony.mass(),
+            95,
+            "a Spear costs 5% of 100, from the bank"
+        );
+        assert_eq!(frame.sacrifice, 0);
+        // Holding the button does not fire it again.
+        let frame = r.update(&press.held(), DT);
+        assert!(frame.form.is_some());
+        assert_eq!(r.colony.mass(), 95);
+    }
+
+    #[test]
+    fn shield_protects_the_queen() {
+        let mut shielded = run(Some(0.0));
+        let mut exposed = run(Some(0.0));
+        shielded.colony.grant(200.0);
+        let press = Controls {
+            form: [false, true],
+            ..Default::default()
+        };
+        shielded.update(&press, DT);
+        assert!(shielded.forms.active.is_some());
+        for r in [&mut exposed, &mut shielded] {
+            for _ in 0..120 {
+                r.queen.pos = r.mop.as_ref().unwrap().pos;
+                r.update(&Controls::default(), DT);
+            }
+        }
+        assert!(shielded.queen.health > exposed.queen.health + 20.0);
+    }
+
+    #[test]
+    fn build_is_held_while_playing() {
+        let mut r = run(None);
+        let frame = r.update(
+            &Controls {
+                build: true,
+                ..Default::default()
+            },
+            DT,
+        );
+        assert!(frame.build);
     }
 
     #[test]

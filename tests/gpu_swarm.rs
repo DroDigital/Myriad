@@ -3,6 +3,7 @@
 //! unless `MYRIAD_REQUIRE_GPU=1` is set (CI sets it).
 
 use glam::Vec2;
+use myriad::forms::FormKind;
 use myriad::game::Controls;
 use myriad::gpu::Gpu;
 use myriad::headless::{self, CAPTURE_FORMAT, HeadlessOptions};
@@ -11,7 +12,8 @@ use myriad::session::{Session, SessionConfig};
 use myriad::sim::material::{FLAG_BLOCKED, FULL, KINDS, Kind, MaterialGrid, MaterialLayout};
 use myriad::sim::stats::SwarmStats;
 use myriad::sim::{
-    Agent, HazardZone, INVALID_CELL, SimFrame, Swarm, SwarmConfig, WorldBounds, counter, spawn_disk,
+    AGENT_ANCHORED, Agent, FLOW_INF, FormShape, HazardZone, INVALID_CELL, SimFrame, Swarm,
+    SwarmConfig, WorldBounds, counter, spawn_disk,
 };
 use myriad::util::SplitMix64;
 
@@ -445,4 +447,184 @@ fn headless_scripted_run_grows_the_swarm() {
     assert!(report.queen_alive);
     assert!(report.peak_mass >= 100, "{report}");
     assert!(report.eaten_fraction > 0.01);
+}
+
+#[test]
+fn flow_field_routes_the_swarm_around_a_cup() {
+    let Some(gpu) = gpu() else { return };
+    let mut layout = MaterialLayout::empty(bounds());
+    // A cup opening toward the swarm: walking straight at the focal point
+    // walks into the cup and gets stuck.
+    layout.fill_rect(Vec2::new(-1.0, -12.0), Vec2::new(1.0, 12.0), Kind::Wall, 0);
+    layout.fill_rect(Vec2::new(-12.0, 11.0), Vec2::new(1.0, 12.0), Kind::Wall, 0);
+    layout.fill_rect(
+        Vec2::new(-12.0, -12.0),
+        Vec2::new(1.0, -11.0),
+        Kind::Wall,
+        0,
+    );
+    let mut rng = SplitMix64::new(21);
+    let agents = spawn_disk(Vec2::new(-6.0, 0.0), 800, 0.5, &mut rng);
+    let (mut swarm, _material) = swarm_on(&gpu, &layout, &agents, 1_024);
+    let focal = Vec2::new(12.0, 0.0);
+    for step in 0..1_200 {
+        swarm.step(&gpu, &frame(focal, step));
+    }
+    // The field: zero at the focal point, and inside the cup the path
+    // distance is the long way round, much more than the straight line.
+    let flow = swarm.read_flow(&gpu).unwrap();
+    assert_eq!(flow[swarm.cell_of(focal) as usize], 0.0);
+    let in_cup = flow[swarm.cell_of(Vec2::new(-4.0, 0.0)) as usize];
+    assert!(
+        in_cup < FLOW_INF && in_cup > 30.0,
+        "path distance in cup {in_cup}"
+    );
+    let alive = alive(&swarm, &gpu);
+    let through = alive.iter().filter(|a| a.pos[0] > 1.0).count();
+    assert!(
+        through * 10 > alive.len() * 8,
+        "only {through}/{} critters found the way round",
+        alive.len()
+    );
+}
+
+#[test]
+fn build_bridges_water_and_letting_go_drowns_the_bridge() {
+    let Some(gpu) = gpu() else { return };
+    let mut layout = MaterialLayout::empty(bounds());
+    // A river across the whole world: the only way over is a bridge.
+    layout.fill_rect(Vec2::new(-2.0, -40.0), Vec2::new(2.0, 40.0), Kind::Water, 0);
+    let mut rng = SplitMix64::new(22);
+    let agents = spawn_disk(Vec2::new(-10.0, 0.0), 800, 0.5, &mut rng);
+    let focal = Vec2::new(10.0, 0.0);
+
+    // Without Build nobody crosses (and nobody drowns).
+    let (mut swarm, _m) = swarm_on(&gpu, &layout, &agents, 1_024);
+    for step in 0..600 {
+        swarm.step(&gpu, &frame(focal, step));
+    }
+    let across = |swarm: &Swarm| alive(swarm, &gpu).iter().filter(|a| a.pos[0] > 2.0).count();
+    assert_eq!(across(&swarm), 0);
+    assert_eq!(swarm.read_counters(&gpu).unwrap()[counter::DIED], 0);
+
+    // With Build held, critters anchor into the water and the rest cross.
+    let (mut swarm, _m) = swarm_on(&gpu, &layout, &agents, 1_024);
+    for step in 0..900 {
+        let mut f = frame(focal, step);
+        f.build = true;
+        swarm.step(&gpu, &f);
+    }
+    let anchored = alive(&swarm, &gpu)
+        .iter()
+        .filter(|a| a.flags & AGENT_ANCHORED != 0)
+        .count();
+    assert!(anchored >= 8, "only {anchored} critters in the bridge");
+    assert!(across(&swarm) > 100, "only {} crossed", across(&swarm));
+
+    // Let go: the bridge comes down and critters left in the water drown.
+    for step in 900..1_200 {
+        swarm.step(&gpu, &frame(focal, step));
+    }
+    assert!(swarm.read_counters(&gpu).unwrap()[counter::DIED] > 0);
+}
+
+/// How deep (x) into a wall of cereal the swarm bores in 10 s.
+fn bore_depth(gpu: &Gpu, form: Option<u32>) -> f32 {
+    let mut layout = MaterialLayout::empty(bounds());
+    layout.fill_rect(
+        Vec2::new(4.0, -40.0),
+        Vec2::new(40.0, 40.0),
+        Kind::Cereal,
+        FULL,
+    );
+    let mut rng = SplitMix64::new(23);
+    let agents = spawn_disk(Vec2::new(-4.0, 0.0), 600, 0.5, &mut rng);
+    let (mut swarm, _m) = swarm_on(gpu, &layout, &agents, 1_024);
+    let focal = Vec2::new(30.0, 0.0);
+    for step in 0..600 {
+        let mut f = frame(focal, step);
+        f.form = form.map(|kind| FormShape {
+            kind,
+            origin: Vec2::new(-2.0, 0.0),
+            dir: Vec2::X,
+            size: 24.0,
+            t: 0.5,
+        });
+        swarm.step(gpu, &f);
+    }
+    alive(&swarm, gpu)
+        .iter()
+        .map(|a| a.pos[0])
+        .fold(f32::MIN, f32::max)
+}
+
+#[test]
+fn spear_bores_through_cereal_much_deeper_than_plain_swarming() {
+    let Some(gpu) = gpu() else { return };
+    let plain = bore_depth(&gpu, None);
+    let spear = bore_depth(&gpu, Some(FormKind::Spear as u32));
+    eprintln!("plain reached x={plain:.1}, spear reached x={spear:.1}");
+    assert!(
+        spear - 4.0 > (plain - 4.0) * 2.0,
+        "plain {plain:.1}, spear {spear:.1}"
+    );
+}
+
+#[test]
+fn shield_cuts_hazard_deaths_by_more_than_half() {
+    let Some(gpu) = gpu() else { return };
+    let queen = Vec2::ZERO;
+    let deaths = |shield: bool| {
+        let mut rng = SplitMix64::new(24);
+        let agents = spawn_disk(queen, 500, 0.5, &mut rng);
+        let mut swarm = swarm_with(&gpu, &agents, 512);
+        let mut total = 0;
+        for step in 0..240 {
+            let mut f = frame(queen, step);
+            f.queen_pos = queen;
+            f.queen_radius = 1.3;
+            f.form = shield.then_some(FormShape {
+                kind: FormKind::Shield as u32,
+                origin: queen,
+                dir: Vec2::X,
+                // As Run sizes it: 0.7 x the rest radius of 500 critters.
+                size: 5.6,
+                t: 0.5,
+            });
+            // The hazard arrives after the swarm has had a second to form up.
+            if step >= 60 {
+                f.hazard = Some(HazardZone {
+                    center: Vec2::new(2.0, 0.0),
+                    radius: 3.5,
+                });
+            }
+            swarm.step(&gpu, &f);
+        }
+        total += swarm.read_counters(&gpu).unwrap()[counter::DIED];
+        total
+    };
+    let exposed = deaths(false);
+    let shielded = deaths(true);
+    eprintln!("exposed {exposed}, shielded {shielded}");
+    assert!(exposed > 20);
+    assert!(
+        shielded * 2 < exposed,
+        "exposed {exposed}, shielded {shielded}"
+    );
+}
+
+#[test]
+fn spending_mass_sacrifices_exactly_that_many() {
+    let Some(gpu) = gpu() else { return };
+    let mut rng = SplitMix64::new(25);
+    let agents = spawn_disk(Vec2::ZERO, 300, 0.5, &mut rng);
+    let mut swarm = swarm_with(&gpu, &agents, 512);
+    let mut f = frame(Vec2::ZERO, 0);
+    f.sacrifice = 40;
+    swarm.step(&gpu, &f);
+    swarm.step(&gpu, &frame(Vec2::ZERO, 1));
+    let counters = swarm.read_counters(&gpu).unwrap();
+    assert_eq!(counters[counter::SACRIFICED], 40);
+    assert_eq!(counters[counter::DIED], 0, "spent critters are not 'lost'");
+    assert_eq!(alive(&swarm, &gpu).len(), 260);
 }

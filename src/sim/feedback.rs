@@ -42,6 +42,8 @@ pub struct SwarmSummary {
     pub eaten_total: u32,
     /// Cumulative critters killed.
     pub died_total: u32,
+    /// Cumulative critters spent on Forms.
+    pub sacrificed_total: u32,
     /// Step number this summary was taken at.
     pub step: u64,
 }
@@ -73,6 +75,7 @@ impl SwarmSummary {
             hatched_total: c(counter::HATCHED),
             eaten_total: c(counter::EATEN),
             died_total: c(counter::DIED),
+            sacrificed_total: c(counter::SACRIFICED),
             step,
         }
     }

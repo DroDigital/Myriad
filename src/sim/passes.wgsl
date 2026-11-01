@@ -1,7 +1,10 @@
 // Swarm passes. Each `//! pass:<name>` section is compiled as its own module
 // (the kind table + common.wgsl prepended) so every pass gets an exact
 // auto-derived layout. Order per step:
-//   [hatch_revive -> hatch_append] -> count -> scan -> scatter -> steer -> (copy) -> reduce
+//   [hatch_revive -> hatch_append] -> water_reset -> count -> scan -> scatter
+//   -> flow x N -> steer -> (copy) -> reduce
+// The `grid` buffer holds per-cell counts in [0, cell_count) and cell start
+// offsets in [cell_count, 2 * cell_count).
 // Agent passes dispatch over the whole capacity and skip slots >= LIVE_END:
 // the GPU owns the population, so the CPU never needs to know which slots
 // are free.
@@ -52,10 +55,11 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 //! pass:count
 // Bucket each living agent into its grid cell and reserve a slot in that cell.
 @group(0) @binding(1) var<storage, read> agents: array<Agent>;
-@group(0) @binding(2) var<storage, read_write> counts: array<atomic<u32>>;
+@group(0) @binding(2) var<storage, read_write> grid: array<atomic<u32>>;
 @group(0) @binding(3) var<storage, read_write> agent_cell: array<u32>;
 @group(0) @binding(4) var<storage, read_write> agent_local: array<u32>;
 @group(0) @binding(5) var<storage, read> counters: array<u32>;
+@group(0) @binding(6) var<storage, read_write> mat_amount: array<atomic<u32>>;
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
@@ -70,13 +74,19 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     }
     let c = cell_index(cell_coord(a.pos));
     agent_cell[i] = c;
-    agent_local[i] = atomicAdd(&counts[c], 1u);
+    agent_local[i] = atomicAdd(&grid[c], 1u);
+    // An anchored critter holds up the water cell it stands in (water cells'
+    // amount is their bridge count, reset each step by water_reset).
+    if ((a.flags & ANCHORED) != 0u) {
+        let rel = (a.pos - params.world_min) / params.mat_cell;
+        let mc = vec2u(clamp(rel, vec2f(0.0), vec2f(params.mat_dim) - vec2f(1.0)));
+        atomicAdd(&mat_amount[mc.y * params.mat_dim.x + mc.x], 1u);
+    }
 }
 
 //! pass:scan
 // Exclusive prefix sum of cell counts -> cell start offsets. One workgroup.
-@group(0) @binding(1) var<storage, read> counts: array<u32>;
-@group(0) @binding(2) var<storage, read_write> starts: array<u32>;
+@group(0) @binding(1) var<storage, read_write> grid: array<u32>;
 
 var<workgroup> partial: array<u32, 256>;
 
@@ -88,7 +98,7 @@ fn main(@builtin(local_invocation_index) t: u32) {
     let end = min(begin + chunk, n);
     var sum = 0u;
     for (var i = begin; i < end; i++) {
-        sum += counts[i];
+        sum += grid[i];
     }
     partial[t] = sum;
     workgroupBarrier();
@@ -103,8 +113,8 @@ fn main(@builtin(local_invocation_index) t: u32) {
     }
     var running = partial[t] - sum;
     for (var i = begin; i < end; i++) {
-        starts[i] = running;
-        running += counts[i];
+        grid[n + i] = running;
+        running += grid[i];
     }
 }
 
@@ -112,7 +122,7 @@ fn main(@builtin(local_invocation_index) t: u32) {
 // Write each agent's index into its cell's slice of the sorted list.
 @group(0) @binding(1) var<storage, read> agent_cell: array<u32>;
 @group(0) @binding(2) var<storage, read> agent_local: array<u32>;
-@group(0) @binding(3) var<storage, read> starts: array<u32>;
+@group(0) @binding(3) var<storage, read> grid: array<u32>;
 @group(0) @binding(4) var<storage, read_write> sorted: array<u32>;
 @group(0) @binding(5) var<storage, read> counters: array<u32>;
 
@@ -126,7 +136,109 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     if (c >= params.cell_count) {
         return; // dead (INVALID) or out of range
     }
-    sorted[starts[c] + agent_local[i]] = i;
+    sorted[grid[params.cell_count + c] + agent_local[i]] = i;
+}
+
+//! pass:water_reset
+// Water cells store how many anchored critters hold them up this step; the
+// count pass rebuilds it, so clear it first.
+@group(0) @binding(1) var<storage, read_write> mat_amount: array<u32>;
+@group(0) @binding(2) var<storage, read> mat_kind: array<u32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+    let i = gid.x;
+    if (i >= params.mat_dim.x * params.mat_dim.y) {
+        return;
+    }
+    var flags = KIND_FLAGS;
+    if ((flags[min(mat_kind[i], KIND_COUNT - 1u)] & FLAG_WATER) != 0u) {
+        mat_amount[i] = 0u;
+    }
+}
+
+//! pass:flow
+// One relaxation sweep of the flow field: each grid cell's path distance to
+// the focal point is the cheapest neighbour's plus the cost of crossing this
+// cell. Run several sweeps per step; it keeps up as the focal point moves and
+// as food is eaten (solid food is costly, not impassable: the swarm can chew
+// through when there is no way round).
+@group(0) @binding(1) var<storage, read_write> flow: array<f32>;
+@group(0) @binding(2) var<storage, read> mat_amount: array<u32>;
+@group(0) @binding(3) var<storage, read> mat_kind: array<u32>;
+
+fn crossing_cost(c: vec2u) -> f32 {
+    let ratio = max(u32(round(params.cell_size / params.mat_cell)), 1u);
+    var flags = KIND_FLAGS;
+    var walls = 0.0;
+    var solid = 0.0;
+    var water = 0.0;
+    for (var sy = 0u; sy < ratio; sy++) {
+        for (var sx = 0u; sx < ratio; sx++) {
+            let m = c * ratio + vec2u(sx, sy);
+            if (m.x >= params.mat_dim.x || m.y >= params.mat_dim.y) {
+                walls += 1.0;
+                continue;
+            }
+            let mi = m.y * params.mat_dim.x + m.x;
+            let f = flags[min(mat_kind[mi], KIND_COUNT - 1u)];
+            let amount = mat_amount[mi];
+            if ((f & FLAG_BLOCKED) != 0u) {
+                walls += 1.0;
+            } else if ((f & FLAG_SOLID) != 0u && amount > 0u) {
+                solid += min(f32(amount) / f32(FULL), 1.0);
+            } else if ((f & FLAG_WATER) != 0u && amount == 0u) {
+                water += 1.0;
+            }
+        }
+    }
+    let n = f32(ratio * ratio);
+    if (walls >= n) {
+        return FLOW_INF;
+    }
+    var cost = 1.0 + 2.0 * walls / n + params.solid_cost * solid / n;
+    if (water > 0.0) {
+        // Open water is only crossable by building a bridge.
+        if (params.build_active == 0u && water >= n) {
+            return FLOW_INF;
+        }
+        cost += water / n * select(20.0, 3.0, params.build_active != 0u);
+    }
+    return cost;
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+    let i = gid.x;
+    if (i >= params.cell_count) {
+        return;
+    }
+    let c = vec2u(i % params.grid_dim.x, i / params.grid_dim.x);
+    if (i == cell_index(cell_coord(params.focal))) {
+        flow[i] = 0.0;
+        return;
+    }
+    let cost = crossing_cost(c);
+    if (cost >= FLOW_INF) {
+        flow[i] = FLOW_INF;
+        return;
+    }
+    var best = FLOW_INF;
+    let gd = vec2i(params.grid_dim);
+    for (var dy = -1; dy <= 1; dy++) {
+        for (var dx = -1; dx <= 1; dx++) {
+            if (dx == 0 && dy == 0) {
+                continue;
+            }
+            let nb = vec2i(c) + vec2i(dx, dy);
+            if (nb.x < 0 || nb.y < 0 || nb.x >= gd.x || nb.y >= gd.y) {
+                continue;
+            }
+            let step_len = select(1.0, 1.4142135, dx != 0 && dy != 0);
+            best = min(best, flow[cell_index(vec2u(nb))] + cost * step_len);
+        }
+    }
+    flow[i] = min(best, FLOW_INF);
 }
 
 //! pass:steer
@@ -140,12 +252,12 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 // the other and make critters pile up on the grid lines.
 @group(0) @binding(1) var<storage, read> agents: array<Agent>;
 @group(0) @binding(2) var<storage, read_write> agents_next: array<Agent>;
-@group(0) @binding(3) var<storage, read> counts: array<u32>;
-@group(0) @binding(4) var<storage, read> starts: array<u32>;
-@group(0) @binding(5) var<storage, read> sorted: array<u32>;
-@group(0) @binding(6) var<storage, read_write> counters: array<atomic<u32>>;
-@group(0) @binding(7) var<storage, read_write> mat_amount: array<atomic<u32>>;
-@group(0) @binding(8) var<storage, read> mat_kind: array<u32>;
+@group(0) @binding(3) var<storage, read> grid: array<u32>;
+@group(0) @binding(4) var<storage, read> sorted: array<u32>;
+@group(0) @binding(5) var<storage, read_write> counters: array<atomic<u32>>;
+@group(0) @binding(6) var<storage, read_write> mat_amount: array<atomic<u32>>;
+@group(0) @binding(7) var<storage, read> mat_kind: array<u32>;
+@group(0) @binding(8) var<storage, read> flow: array<f32>;
 
 var<workgroup> wg_eaten: atomic<u32>;
 var<workgroup> wg_died: atomic<u32>;
@@ -185,7 +297,109 @@ fn blocked(p: vec2f) -> bool {
     if ((f & FLAG_SOLID) != 0u) {
         return atomicLoad(&mat_amount[ci]) > 0u;
     }
+    if ((f & FLAG_WATER) != 0u) {
+        // Open water blocks; water held up by anchored critters is a bridge.
+        return atomicLoad(&mat_amount[ci]) == 0u;
+    }
     return false;
+}
+
+fn is_open_water(ci: i32) -> bool {
+    return ci >= 0 && (kind_flags(mat_kind[ci]) & FLAG_WATER) != 0u
+        && atomicLoad(&mat_amount[ci]) == 0u;
+}
+
+// Downhill direction of the flow field at `p` (xy) and the path distance
+// there (z). z < 0 when the field has no answer yet (unreached or blocked).
+fn flow_dir(p: vec2f) -> vec3f {
+    let cc = vec2i(cell_coord(p));
+    let gd = vec2i(params.grid_dim);
+    let d0 = flow[cell_index(vec2u(cc))];
+    if (d0 >= FLOW_INF * 0.5) {
+        return vec3f(0.0, 0.0, -1.0);
+    }
+    var dir = vec2f(0.0);
+    for (var dy = -1; dy <= 1; dy++) {
+        for (var dx = -1; dx <= 1; dx++) {
+            let nb = cc + vec2i(dx, dy);
+            if ((dx == 0 && dy == 0) || nb.x < 0 || nb.y < 0 || nb.x >= gd.x || nb.y >= gd.y) {
+                continue;
+            }
+            let off = vec2f(f32(dx), f32(dy));
+            let drop = d0 - flow[cell_index(vec2u(nb))];
+            if (drop > 0.0) {
+                dir += off / dot(off, off) * drop;
+            }
+        }
+    }
+    if (length(dir) < 1e-5) {
+        return vec3f(0.0, 0.0, -1.0);
+    }
+    return vec3f(normalize(dir), d0);
+}
+
+// Where the active Form wants this critter: xy = pull, z = 1 inside the Form.
+fn form_pull(p: vec2f, seed: f32) -> vec3f {
+    let o = params.form_origin;
+    let size = params.form_size;
+    switch params.form_kind {
+        case FORM_SPEAR: {
+            // A line from the swarm out along the aim. Each critter takes its
+            // own spot along it (from its seed), which stretches the swarm out
+            // instead of just sliding it forward.
+            let tip = o + params.form_dir * size;
+            let ab = tip - o;
+            let slot = o + ab * seed;
+            let to_slot = slot - p;
+            let ds = max(length(to_slot), 1e-3);
+            let h = clamp(dot(p - o, ab) / dot(ab, ab), 0.0, 1.0);
+            let on_line = distance(p, o + ab * h) < max(1.0, size * 0.12) + 1.0;
+            return vec3f(to_slot / ds * min(ds, 6.0) * 14.0, select(0.0, 1.0, on_line));
+        }
+        case FORM_SHIELD: {
+            // A tight shell around the Queen.
+            let d = p - o;
+            let len = max(length(d), 1e-3);
+            let q = o + d / len * size;
+            // The band is thick enough to hold the whole swarm.
+            let band = max(1.5, size * 0.5);
+            return vec3f((q - p) * 8.0, select(0.0, 1.0, abs(len - size) < band));
+        }
+        case FORM_RING: {
+            // A circle that closes in, crushing what is inside.
+            let r = size * mix(1.0, 0.35, params.form_t);
+            let d = p - o;
+            let len = max(length(d), 1e-3);
+            let q = o + d / len * r;
+            return vec3f((q - p) * 8.0, select(0.0, 1.0, abs(len - r) < 1.5));
+        }
+        case FORM_COMET: {
+            // A tight ball rushing along the aim direction.
+            return vec3f((o - p) * 2.0, 1.0);
+        }
+        case FORM_BLOOM: {
+            // A burst outward that fades.
+            let d = p - o;
+            let len = max(length(d), 1e-3);
+            return vec3f(d / len * 45.0 * (1.0 - params.form_t), 1.0);
+        }
+        default: {
+            return vec3f(0.0);
+        }
+    }
+}
+
+// How much faster critters inside the Form eat.
+fn form_eat_mult(in_form: bool) -> f32 {
+    if (!in_form) {
+        return 1.0;
+    }
+    switch params.form_kind {
+        case FORM_SPEAR: { return 4.0; }
+        case FORM_RING: { return 3.0; }
+        case FORM_BLOOM: { return 2.0; }
+        default: { return 1.0; }
+    }
 }
 
 // Takes up to `want` food from cell `ci`; returns what was actually taken.
@@ -252,6 +466,27 @@ fn simulate(i: u32) -> vec2u {
         agents_next[i] = a;
         return vec2u(0u);
     }
+    // Spend critters on Forms when the bank cannot cover the cost.
+    if (params.sacrifice > 0u && atomicAdd(&counters[SAC_TICKETS], 1u) < params.sacrifice) {
+        a.flags = 0u;
+        agents_next[i] = a;
+        atomicAdd(&counters[SACRIFICED], 1u);
+        return vec2u(0u, 0u);
+    }
+    // Bridge builders hold still while Build is held, then let go.
+    if ((a.flags & ANCHORED) != 0u) {
+        if (params.build_active != 0u) {
+            a.vel = vec2f(0.0);
+            var died = 0u;
+            if (params.hazard_active != 0u && distance(a.pos, params.hazard_pos) < params.hazard_radius) {
+                a.flags = 0u;
+                died = 1u;
+            }
+            agents_next[i] = a;
+            return vec2u(0u, died);
+        }
+        a.flags &= ~ANCHORED;
+    }
 
     let cc = vec2i(cell_coord(a.pos));
     let gd = vec2i(params.grid_dim);
@@ -274,8 +509,8 @@ fn simulate(i: u32) -> vec2u {
                 continue;
             }
             let ci = cell_index(vec2u(c));
-            let s = starts[ci];
-            let cnt = counts[ci];
+            let s = grid[params.cell_count + ci];
+            let cnt = grid[ci];
             if (cnt == 0u) {
                 continue;
             }
@@ -338,12 +573,34 @@ fn simulate(i: u32) -> vec2u {
     let rest_sum = params.rest_density * 1.0471976 * nr * nr;
     let crowding = max(dens / rest_sum - 1.0, 0.0);
 
-    // Seek the focal point, slowing on arrival so the swarm pools around it.
+    // Seek the focal point along the flow field (around walls, over bridges,
+    // through food only when there is no way round), slowing on arrival so the
+    // swarm pools around it. Close in, or where the field has no answer, head
+    // straight for it.
     let to_focal = params.focal - a.pos;
     let df = length(to_focal);
     var desired = vec2f(0.0);
-    if (df > 1e-4) {
+    let fd = flow_dir(a.pos);
+    if (fd.z > 2.5) {
+        desired = fd.xy * params.max_speed * smoothstep(0.0, params.slow_radius, fd.z);
+    } else if (df > 1e-4) {
         desired = (to_focal / df) * params.max_speed * smoothstep(0.0, params.slow_radius, df);
+    }
+    // The active Form reshapes the swarm.
+    let fp = form_pull(a.pos, a.seed);
+    let in_form = fp.z > 0.5;
+    var vmax_mult = 1.5;
+    if (params.form_kind == FORM_SPEAR) {
+        vmax_mult = 2.5;
+    }
+    if (params.form_kind == FORM_COMET) {
+        desired = params.form_dir * params.max_speed * 2.5;
+        vmax_mult = 3.0;
+    } else if (params.form_kind == FORM_SHIELD) {
+        // Turtle: stop advancing and hold the shell.
+        desired = vec2f(0.0);
+    } else if (params.form_kind != FORM_NONE && params.form_kind != FORM_BLOOM) {
+        desired *= 0.3;
     }
     // Critters deep in a crowd shove a little less, so a big swarm flows
     // rather than crushing its own front.
@@ -361,6 +618,7 @@ fn simulate(i: u32) -> vec2u {
     // Forage: drift toward the richest food nearby, so the swarm flows over
     // whatever the player steers it onto instead of milling on bare floor.
     acc += forage(a.pos, a.seed) * params.forage_strength;
+    acc += fp.xy;
     // The Queen's body: critters make room around her.
     let from_queen = a.pos - params.queen_pos;
     let dq = length(from_queen);
@@ -374,7 +632,7 @@ fn simulate(i: u32) -> vec2u {
     a.vel += acc * params.dt;
     a.vel *= 1.0 / (1.0 + params.damping * params.dt);
     let speed = length(a.vel);
-    let vmax = params.max_speed * 1.5;
+    let vmax = params.max_speed * vmax_mult;
     if (speed > vmax) {
         a.vel *= vmax / speed;
     }
@@ -402,6 +660,16 @@ fn simulate(i: u32) -> vec2u {
             a.vel *= -0.2;
         }
     }
+    // Build: a critter that bumps into open water steps in and holds still,
+    // becoming part of a bridge the rest can walk over.
+    if (params.build_active != 0u && collided && !blocked(old)) {
+        let wc = mat_cell(attempted);
+        if (is_open_water(wc)) {
+            np = attempted;
+            a.vel = vec2f(0.0);
+            a.flags |= ANCHORED;
+        }
+    }
     np = clamp(np, params.world_min, params.world_max);
     a.pos = np;
     a.crowding = crowding;
@@ -413,7 +681,7 @@ fn simulate(i: u32) -> vec2u {
         let k = mat_kind[here];
         let f = kind_flags(k);
         if ((f & FLAG_EDIBLE) != 0u && (f & FLAG_SOLID) == 0u) {
-            eaten += bite(here, bite_size(k));
+            eaten += bite(here, u32(f32(bite_size(k)) * form_eat_mult(in_form)));
         }
     }
     // Solid food: bite the cell it just bumped into, or else the one just
@@ -435,15 +703,24 @@ fn simulate(i: u32) -> vec2u {
         let k = mat_kind[gnaw];
         let f = kind_flags(k);
         if ((f & FLAG_EDIBLE) != 0u && (f & FLAG_SOLID) != 0u) {
-            eaten += bite(gnaw, bite_size(k));
+            eaten += bite(gnaw, u32(f32(bite_size(k)) * form_eat_mult(in_form)));
         }
     }
 
-    // Hazards kill on contact.
+    // Hazards kill on contact, except critters holding the Shield. Critters
+    // left on open water (a bridge let go) may drown.
     var died = 0u;
-    if (params.hazard_active != 0u && distance(np, params.hazard_pos) < params.hazard_radius) {
-        a.flags &= ~ALIVE;
+    let shielded = params.form_kind == FORM_SHIELD && in_form;
+    if (params.hazard_active != 0u && !shielded
+        && distance(np, params.hazard_pos) < params.hazard_radius) {
         died = 1u;
+    }
+    if ((a.flags & ANCHORED) == 0u && is_open_water(mat_cell(np))
+        && hash_f(i ^ hash_u32(params.step * 0x9e3779b9u)) < params.drown_rate) {
+        died = 1u;
+    }
+    if (died != 0u) {
+        a.flags = 0u;
     }
     agents_next[i] = a;
     return vec2u(eaten, died);
