@@ -42,7 +42,23 @@ struct Params {
     // Critters within this distance of the focal point form the swarm's
     // "main body" (what the Queen and camera follow).
     body_radius: f32,
-    pad1: f32,
+    // Path-cost multiplier for chewing through solid food (flow field).
+    solid_cost: f32,
+    // Active Form (0 = none; see `forms.rs`), its progress 0..1, where it is
+    // centred, which way it points, and its size.
+    form_origin: vec2f,
+    form_dir: vec2f,
+    form_kind: u32,
+    form_t: f32,
+    form_size: f32,
+    // Non-zero while the Build button is held.
+    build_active: u32,
+    // Critters to give up this step (mass spent beyond the bank).
+    sacrifice: u32,
+    // Chance per step that a critter on open water drowns.
+    drown_rate: f32,
+    pad2: f32,
+    pad3: f32,
 }
 
 struct Agent {
@@ -56,6 +72,8 @@ struct Agent {
 }
 
 const ALIVE: u32 = 1u;
+// Holding a bridge over water (only while Build is held).
+const ANCHORED: u32 = 2u;
 const INVALID: u32 = 0xffffffffu;
 
 // Indices into the `counters` buffer. Must match `counter` in src/sim/mod.rs.
@@ -64,6 +82,18 @@ const HATCHED: u32 = 1u;       // cumulative hatchlings placed
 const EATEN: u32 = 2u;         // cumulative food eaten, fixed point (FULL = 1 cell)
 const DIED: u32 = 3u;          // cumulative critters killed
 const TICKETS: u32 = 4u;       // per step: dead slots that claimed a hatch ticket
+const SACRIFICED: u32 = 5u;    // cumulative critters spent on Forms
+const SAC_TICKETS: u32 = 6u;   // per step: critters that claimed a sacrifice ticket
+
+// Form kinds. Must match `FormKind` in src/forms.rs.
+const FORM_NONE: u32 = 0u;
+const FORM_SPEAR: u32 = 1u;
+const FORM_SHIELD: u32 = 2u;
+const FORM_RING: u32 = 3u;
+const FORM_COMET: u32 = 4u;
+const FORM_BLOOM: u32 = 5u;
+
+const FLOW_INF: f32 = 1e9;
 
 @group(0) @binding(0) var<uniform> params: Params;
 

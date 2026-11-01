@@ -17,9 +17,9 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      # GPU tests run on Mesa's software Vulkan driver (lavapipe).
-      - name: Install lavapipe
-        run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
+      # GPU tests run on Mesa's software Vulkan driver (lavapipe); gilrs needs udev.
+      - name: Install lavapipe and udev
+        run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers libudev-dev
       - name: Format
         run: cargo fmt --check
       - name: Clippy

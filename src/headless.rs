@@ -53,6 +53,8 @@ pub struct HeadlessReport {
     pub peak_mass: u32,
     pub eaten_fraction: f64,
     pub queen_alive: bool,
+    /// Share of living critters in the main body (stragglers drag it down).
+    pub body_share: f64,
     pub screenshot: Option<PathBuf>,
 }
 
@@ -62,11 +64,12 @@ impl fmt::Display for HeadlessReport {
         writeln!(f, "{} steps: {:.3} ms/step", self.frames, self.ms_per_step)?;
         writeln!(
             f,
-            "run: mass {} (peak {}) | {:.1}% of the kitchen eaten | queen {}",
+            "run: mass {} (peak {}) | {:.1}% of the kitchen eaten | queen {} | {:.1}% in the main body",
             self.mass,
             self.peak_mass,
             self.eaten_fraction * 100.0,
-            if self.queen_alive { "alive" } else { "fallen" }
+            if self.queen_alive { "alive" } else { "fallen" },
+            self.body_share * 100.0
         )?;
         write!(f, "swarm: {}", self.stats)?;
         if let Some(path) = &self.screenshot {
@@ -140,9 +143,26 @@ impl Script {
         }
         Controls {
             pointer: Some(target),
+            // Stuck on the way (water in the way, most likely): build.
+            build: !arrived && self.travel > 4.0,
             ..Default::default()
         }
     }
+}
+
+/// Share of living critters within reach of the focal point (the swarm's
+/// main body: the swarm's rest radius plus a margin).
+pub fn body_share(agents: &[crate::sim::Agent], focal: Vec2, swarm_radius: f32) -> f64 {
+    let reach = swarm_radius * 2.0 + 8.0;
+    let alive: Vec<_> = agents.iter().filter(|a| a.is_alive()).collect();
+    if alive.is_empty() {
+        return 0.0;
+    }
+    let near = alive
+        .iter()
+        .filter(|a| a.pos().distance(focal) < reach)
+        .count();
+    near as f64 / alive.len() as f64
 }
 
 pub const CAPTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
@@ -222,6 +242,7 @@ pub fn run(opts: &HeadlessOptions) -> Result<HeadlessReport> {
         peak_mass: run.colony.peak_mass,
         eaten_fraction: run.eaten_fraction(),
         queen_alive: run.state == RunState::Playing,
+        body_share: body_share(&agents, run.game.focal, run.game.swarm_radius),
         screenshot,
     })
 }

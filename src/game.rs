@@ -16,6 +16,26 @@ pub struct Controls {
     pub gather: f32,
     /// When set (mouse held), the focal point heads for this world position.
     pub pointer: Option<Vec2>,
+    /// Form slot buttons pressed this frame (edge-triggered).
+    pub form: [bool; 2],
+    /// Cycle the Form in each slot (edge-triggered; prototype loadout picker).
+    pub cycle: [bool; 2],
+    /// Build held.
+    pub build: bool,
+    /// Where the player is aiming, for Forms (world space), if anywhere.
+    pub aim: Option<Vec2>,
+}
+
+impl Controls {
+    /// The same held inputs with this frame's button presses cleared, so a
+    /// press fires once even when a frame runs several simulation steps.
+    pub fn held(&self) -> Self {
+        Self {
+            form: [false; 2],
+            cycle: [false; 2],
+            ..*self
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

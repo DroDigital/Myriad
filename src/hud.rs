@@ -87,6 +87,43 @@ pub fn build(run: &Run, w: f32, h: f32) -> TextBatch {
         s,
     );
 
+    // Form slots, bottom left: key, name, cost or cooldown.
+    let mass = run.colony.mass();
+    let keys = ["Z", "X"];
+    for (slot, kind) in run.forms.slots.iter().enumerate() {
+        let def = kind.def();
+        let (state, color) = match run.forms.active {
+            Some(a) if a.slot == slot => ("ACTIVE".to_string(), color::GREEN),
+            _ if run.forms.cooldown[slot] > 0.0 => (
+                format!("{:.0}S", run.forms.cooldown[slot].ceil()),
+                color::DIM,
+            ),
+            _ if kind.cost(mass) >= mass => ("TOO FEW".to_string(), color::DIM),
+            _ => (format!("-{}", kind.cost(mass)), color::AMBER),
+        };
+        let y = h - margin - (3.0 - slot as f32) * line * 1.2;
+        b.text(
+            margin,
+            y,
+            &format!("{} {}", keys[slot], def.name),
+            color::WHITE,
+            s,
+        );
+        b.text(
+            margin + TextBatch::width("Z SHIELD  ", s),
+            y,
+            &state,
+            color,
+            s,
+        );
+    }
+    let build_color = if run.building {
+        color::GREEN
+    } else {
+        color::DIM
+    };
+    b.text(margin, h - margin - line * 1.2, "B BUILD", build_color, s);
+
     // Level progress, top right.
     let pct = format!("KITCHEN {:.0}% EATEN", run.eaten_fraction() * 100.0);
     b.text(
@@ -157,6 +194,21 @@ mod tests {
                 .iter()
                 .all(|g| g.pos[0] >= 0.0 && g.pos[0] < 1280.0)
         );
+    }
+
+    #[test]
+    fn shows_form_slots_and_build() {
+        let run = Run::new(&Level::kitchen(1), &RunConfig::default(), 16.0 / 9.0);
+        let t = text_of(&build(&run, 1280.0, 720.0));
+        assert!(t.contains("ZSPEAR"), "{t}");
+        assert!(t.contains("XSHIELD"));
+        assert!(t.contains("-8"), "a Shield costs 8 at mass 10: {t}");
+        assert!(t.contains("BBUILD"));
+        // A swarm of 5 cannot pay for either.
+        let mut tiny = Run::new(&Level::kitchen(1), &RunConfig::default(), 16.0 / 9.0);
+        tiny.colony.alive = 5;
+        let t = text_of(&build(&tiny, 1280.0, 720.0));
+        assert_eq!(t.matches("TOOFEW").count(), 2, "{t}");
     }
 
     #[test]

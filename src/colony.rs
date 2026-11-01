@@ -19,8 +19,10 @@ pub struct Colony {
     pub bank: f64,
     /// Living critters, as of the latest summary.
     pub alive: u32,
-    /// Critters lost so far.
+    /// Critters lost so far (hazards, drowning).
     pub lost: u32,
+    /// Critters spent on Forms so far.
+    pub spent: u32,
     /// Food eaten so far, in full cells.
     pub food_eaten: f64,
     /// Highest mass reached.
@@ -28,6 +30,8 @@ pub struct Colony {
     eaten_seen: u32,
     requested_total: u64,
     confirmed_total: u32,
+    sacrifice_requested: u64,
+    sacrifice_confirmed: u32,
 }
 
 impl Colony {
@@ -45,9 +49,27 @@ impl Colony {
             .saturating_sub(self.confirmed_total as u64) as u32
     }
 
-    /// Total mass: living critters, hatchlings on the way, and the bank.
+    /// Critters asked to be spent but not yet confirmed gone.
+    pub fn sacrifice_pending(&self) -> u32 {
+        self.sacrifice_requested
+            .saturating_sub(self.sacrifice_confirmed as u64) as u32
+    }
+
+    /// Total mass: living critters, hatchlings on the way, and the bank, less
+    /// critters already spent but still on the GPU.
     pub fn mass(&self) -> u32 {
-        self.alive + self.in_flight() + self.bank.floor() as u32
+        (self.alive + self.in_flight() + self.bank.floor() as u32)
+            .saturating_sub(self.sacrifice_pending())
+    }
+
+    /// Pays `cost` mass: from the bank first, then by giving up critters.
+    /// Returns how many critters must be sacrificed.
+    pub fn spend(&mut self, cost: u32) -> u32 {
+        let from_bank = (self.bank.floor() as u32).min(cost);
+        self.bank -= from_bank as f64;
+        let rest = cost - from_bank;
+        self.sacrifice_requested += rest as u64;
+        rest
     }
 
     /// Folds in a summary from the GPU.
@@ -58,6 +80,8 @@ impl Colony {
         self.bank += new_food * CRITTERS_PER_CELL;
         self.alive = s.alive;
         self.lost = s.died_total;
+        self.spent = s.sacrificed_total;
+        self.sacrifice_confirmed = s.sacrificed_total;
         self.confirmed_total = s.hatched_total;
         self.peak_mass = self.peak_mass.max(self.mass());
     }
@@ -109,6 +133,21 @@ mod tests {
         // The rest of the bank follows.
         let second = c.take_hatch(1_000);
         assert_eq!(first + second, 20);
+    }
+
+    #[test]
+    fn spending_uses_the_bank_then_critters() {
+        let mut c = Colony::new(100);
+        c.grant(5.0);
+        assert_eq!(c.mass(), 105);
+        assert_eq!(c.spend(12), 7, "5 from the bank, 7 critters");
+        assert_eq!(c.mass(), 93, "pending sacrifices already count");
+        c.observe(&SwarmSummary {
+            alive: 93,
+            sacrificed_total: 7,
+            ..Default::default()
+        });
+        assert_eq!((c.mass(), c.spent, c.sacrifice_pending()), (93, 7, 0));
     }
 
     #[test]

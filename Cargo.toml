@@ -10,6 +10,7 @@ description = "A survivors-like turned inside out: you are the horde."
 anyhow = "1"
 bytemuck = { version = "1.25", features = ["derive"] }
 env_logger = "0.11"
+gilrs = "0.11"
 glam = { version = "0.34", features = ["bytemuck"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 log = "0.4"
