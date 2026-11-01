@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # GPU tests run on Mesa's software Vulkan driver (lavapipe).
+      - name: Install lavapipe
+        run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test
+        env:
+          MYRIAD_REQUIRE_GPU: "1"
+      - name: Headless smoke run
+        run: cargo run -- --headless --agents 20000 --frames 300 --screenshot target/smoke.png
+      - uses: actions/upload-artifact@v4
+        with:
+          name: smoke-screenshot
+          path: target/smoke.png
