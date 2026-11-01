@@ -11,11 +11,14 @@ pub const USAGE: &str = "\
 Usage: myriad [OPTIONS]
 
 Options:
-  --agents N         critters to start with (default: 2000 windowed, 20000 headless)
+  --agents N         critters to start with (default 10)
   --capacity N       maximum critters (default 32768)
   --seed N           random seed (default 1)
-  --headless         run without a window: scripted steering, timing and stats
-  --frames N         headless: simulation steps to run (default 600)
+  --dev              developer keys (H: +100 mass)
+  --no-hazard        windowed: leave the mop out
+  --headless         run without a window: a scripted player tours the food
+  --hazard           headless: include the mop
+  --frames N         headless: simulation steps to run (default 3600)
   --width N          headless: screenshot width (default 1280)
   --height N         headless: screenshot height (default 720)
   --screenshot PATH  headless: save the final frame as a PNG
@@ -24,7 +27,7 @@ Options:
 Controls (windowed):
   WASD / arrows  steer the focal point     left mouse  steer toward cursor
   Space          Gather                    Shift       Spread
-  H              hatch 1000 critters       Esc         quit";
+  R              restart                   Esc         quit";
 
 #[derive(Debug)]
 pub enum Command {
@@ -35,6 +38,8 @@ pub enum Command {
 
 pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command> {
     let mut headless = false;
+    let mut dev = false;
+    let mut no_hazard = false;
     let mut agents = None;
     let mut capacity = 32_768;
     let mut seed = 1;
@@ -45,6 +50,9 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command> {
         match arg.as_str() {
             "-h" | "--help" => return Ok(Command::Help),
             "--headless" => headless = true,
+            "--dev" => dev = true,
+            "--no-hazard" => no_hazard = true,
+            "--hazard" => h.hazard = true,
             "--agents" => agents = Some(number(&value("--agents")?)?),
             "--capacity" => capacity = number(&value("--capacity")?)?,
             "--seed" => seed = number(&value("--seed")?)?,
@@ -65,9 +73,11 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command> {
         Ok(Command::Headless(h))
     } else {
         Ok(Command::Windowed(AppOptions {
-            agents: agents.unwrap_or(2_000),
+            agents: agents.unwrap_or(10),
             capacity,
             seed,
+            dev,
+            hazard: !no_hazard,
         }))
     }
 }
@@ -89,7 +99,10 @@ mod tests {
     #[test]
     fn default_is_windowed() {
         match parse(args("")).unwrap() {
-            Command::Windowed(o) => assert_eq!(o.agents, 2_000),
+            Command::Windowed(o) => {
+                assert_eq!(o.agents, 10);
+                assert!(o.hazard && !o.dev);
+            }
             other => panic!("{other:?}"),
         }
     }
@@ -97,13 +110,14 @@ mod tests {
     #[test]
     fn headless_options() {
         match parse(args(
-            "--headless --agents 10_000 --frames 5 --screenshot out/a.png",
+            "--headless --hazard --agents 10_000 --frames 5 --screenshot out/a.png",
         ))
         .unwrap()
         {
             Command::Headless(h) => {
                 assert_eq!(h.agents, 10_000);
                 assert_eq!(h.frames, 5);
+                assert!(h.hazard);
                 assert_eq!(h.screenshot.unwrap(), PathBuf::from("out/a.png"));
             }
             other => panic!("{other:?}"),

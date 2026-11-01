@@ -5,7 +5,7 @@ use glam::Vec2;
 
 use crate::camera::{Camera2D, zoom_for_count};
 use crate::render::CameraUniform;
-use crate::sim::{SimFrame, WorldBounds};
+use crate::sim::WorldBounds;
 
 /// Player intent for one step, produced by the input layer or a script.
 #[derive(Clone, Copy, Debug, Default)]
@@ -84,15 +84,6 @@ impl Game {
         self.gather += (target - self.gather).clamp(-max_delta, max_delta);
     }
 
-    pub fn sim_frame(&self, dt: f32) -> SimFrame {
-        SimFrame {
-            focal: self.focal,
-            gather: self.gather,
-            dt,
-            time: self.time,
-        }
-    }
-
     /// Records the latest swarm feedback.
     pub fn observe_swarm(&mut self, center: Vec2, radius: f32) {
         self.swarm_center = Some(center);
@@ -114,7 +105,12 @@ impl Game {
             .follow(self.camera_target(), zoom_for_count(count), dt);
     }
 
-    pub fn camera_uniform(&self, viewport_height: u32) -> CameraUniform {
+    pub fn camera_uniform(
+        &self,
+        viewport_height: u32,
+        mat_dim: [u32; 2],
+        mat_cell: f32,
+    ) -> CameraUniform {
         CameraUniform {
             center: self.camera.center.to_array(),
             half_extent: self.camera.half_extent().to_array(),
@@ -125,7 +121,9 @@ impl Game {
             world_max: self.bounds.max.to_array(),
             gather: self.gather,
             pixel_world: self.camera.pixel_world(viewport_height),
-            _pad: [0.0; 2],
+            mat_dim,
+            mat_cell,
+            ..Default::default()
         }
     }
 }

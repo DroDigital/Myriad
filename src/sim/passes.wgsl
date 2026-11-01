@@ -1,6 +1,53 @@
 // Swarm passes. Each `//! pass:<name>` section is compiled as its own module
-// (prefixed with common.wgsl) so every pass gets an exact auto-derived layout.
-// Order per step: count -> scan -> scatter -> steer.
+// (the kind table + common.wgsl prepended) so every pass gets an exact
+// auto-derived layout. Order per step:
+//   [hatch_revive -> hatch_append] -> count -> scan -> scatter -> steer -> (copy) -> reduce
+// Agent passes dispatch over the whole capacity and skip slots >= LIVE_END:
+// the GPU owns the population, so the CPU never needs to know which slots
+// are free.
+
+//! pass:hatch_revive
+// Dead slots below LIVE_END claim hatch tickets first, so slots get reused.
+@group(0) @binding(1) var<storage, read_write> agents: array<Agent>;
+@group(0) @binding(2) var<storage, read_write> counters: array<atomic<u32>>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+    let i = gid.x;
+    if (i >= atomicLoad(&counters[LIVE_END]) || (agents[i].flags & ALIVE) != 0u) {
+        return;
+    }
+    let ticket = atomicAdd(&counters[TICKETS], 1u);
+    if (ticket >= params.hatch_count) {
+        return;
+    }
+    agents[i] = hatchling(i);
+    atomicAdd(&counters[HATCHED], 1u);
+}
+
+//! pass:hatch_append
+// Tickets no dead slot claimed extend the live range, up to capacity.
+@group(0) @binding(1) var<storage, read_write> agents: array<Agent>;
+@group(0) @binding(2) var<storage, read_write> counters: array<atomic<u32>>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+    let t = gid.x;
+    if (t >= params.hatch_count) {
+        return;
+    }
+    let covered = min(atomicLoad(&counters[TICKETS]), params.hatch_count);
+    if (t < covered) {
+        return;
+    }
+    let idx = atomicAdd(&counters[LIVE_END], 1u);
+    if (idx >= params.capacity) {
+        atomicSub(&counters[LIVE_END], 1u);
+        return;
+    }
+    agents[idx] = hatchling(idx);
+    atomicAdd(&counters[HATCHED], 1u);
+}
 
 //! pass:count
 // Bucket each living agent into its grid cell and reserve a slot in that cell.
@@ -8,11 +55,12 @@
 @group(0) @binding(2) var<storage, read_write> counts: array<atomic<u32>>;
 @group(0) @binding(3) var<storage, read_write> agent_cell: array<u32>;
 @group(0) @binding(4) var<storage, read_write> agent_local: array<u32>;
+@group(0) @binding(5) var<storage, read> counters: array<u32>;
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
     let i = gid.x;
-    if (i >= params.agent_count) {
+    if (i >= counters[LIVE_END]) {
         return;
     }
     let a = agents[i];
@@ -66,23 +114,25 @@ fn main(@builtin(local_invocation_index) t: u32) {
 @group(0) @binding(2) var<storage, read> agent_local: array<u32>;
 @group(0) @binding(3) var<storage, read> starts: array<u32>;
 @group(0) @binding(4) var<storage, read_write> sorted: array<u32>;
+@group(0) @binding(5) var<storage, read> counters: array<u32>;
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
     let i = gid.x;
-    if (i >= params.agent_count) {
+    if (i >= counters[LIVE_END]) {
         return;
     }
     let c = agent_cell[i];
-    if (c == INVALID) {
-        return;
+    if (c >= params.cell_count) {
+        return; // dead (INVALID) or out of range
     }
     sorted[starts[c] + agent_local[i]] = i;
 }
 
 //! pass:steer
-// Flocking + crowd pressure + seek toward the focal point, then integrate.
-// Reads `agents`, writes `agents_next` (copied back after the pass).
+// Flocking + crowd pressure + seek toward the focal point, then integrate with
+// collision against the material grid, eat, and die to hazards. Reads
+// `agents`, writes `agents_next` (copied back after the pass).
 //
 // Neighbour sums are estimated without bias: each of the 9 cells gets an equal
 // budget, and a cell's sampled sum is scaled up by (others in cell / sampled).
@@ -93,17 +143,114 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 @group(0) @binding(3) var<storage, read> counts: array<u32>;
 @group(0) @binding(4) var<storage, read> starts: array<u32>;
 @group(0) @binding(5) var<storage, read> sorted: array<u32>;
+@group(0) @binding(6) var<storage, read_write> counters: array<atomic<u32>>;
+@group(0) @binding(7) var<storage, read_write> mat_amount: array<atomic<u32>>;
+@group(0) @binding(8) var<storage, read> mat_kind: array<u32>;
 
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3u) {
-    let i = gid.x;
-    if (i >= params.agent_count) {
-        return;
+var<workgroup> wg_eaten: atomic<u32>;
+var<workgroup> wg_died: atomic<u32>;
+
+fn kind_flags(k: u32) -> u32 {
+    var table = KIND_FLAGS;
+    return table[min(k, KIND_COUNT - 1u)];
+}
+
+fn kind_rate(k: u32) -> f32 {
+    var table = KIND_RATE;
+    return table[min(k, KIND_COUNT - 1u)];
+}
+
+// Material cell at a world position, or -1 outside the grid.
+fn mat_cell(p: vec2f) -> i32 {
+    let rel = (p - params.world_min) / params.mat_cell;
+    if (rel.x < 0.0 || rel.y < 0.0) {
+        return -1;
     }
+    let c = vec2u(rel);
+    if (c.x >= params.mat_dim.x || c.y >= params.mat_dim.y) {
+        return -1;
+    }
+    return i32(c.y * params.mat_dim.x + c.x);
+}
+
+fn blocked(p: vec2f) -> bool {
+    let ci = mat_cell(p);
+    if (ci < 0) {
+        return true;
+    }
+    let f = kind_flags(mat_kind[ci]);
+    if ((f & FLAG_BLOCKED) != 0u) {
+        return true;
+    }
+    if ((f & FLAG_SOLID) != 0u) {
+        return atomicLoad(&mat_amount[ci]) > 0u;
+    }
+    return false;
+}
+
+// Takes up to `want` food from cell `ci`; returns what was actually taken.
+// Compare-exchange keeps the books exact: eaten == removed, never negative.
+fn bite(ci: i32, want: u32) -> u32 {
+    if (want == 0u) {
+        return 0u;
+    }
+    var cur = atomicLoad(&mat_amount[ci]);
+    for (var tries = 0; tries < 8; tries++) {
+        if (cur == 0u) {
+            return 0u;
+        }
+        let take = min(cur, want);
+        let r = atomicCompareExchangeWeak(&mat_amount[ci], cur, cur - take);
+        if (r.exchanged) {
+            return take;
+        }
+        cur = r.old_value;
+    }
+    return 0u;
+}
+
+// Unit-ish vector toward nearby food (zero if none in reach). Samples two
+// rings of 8 directions, rotated per critter so the swarm doesn't streak.
+fn forage(p: vec2f, seed: f32) -> vec2f {
+    var pull = vec2f(0.0);
+    var best = 0.0;
+    for (var ring = 1; ring <= 2; ring++) {
+        let r = params.forage_radius * f32(ring) * 0.5;
+        for (var k = 0; k < 8; k++) {
+            let ang = (f32(k) + seed) * 0.7853982;
+            let dir = vec2f(cos(ang), sin(ang));
+            let ci = mat_cell(p + dir * r);
+            if (ci < 0) {
+                continue;
+            }
+            let kind = mat_kind[ci];
+            if ((kind_flags(kind) & FLAG_EDIBLE) == 0u) {
+                continue;
+            }
+            let food = f32(atomicLoad(&mat_amount[ci])) / f32(FULL);
+            // Nearer food counts for more.
+            let w = food / f32(ring);
+            pull += dir * w;
+            best = max(best, w);
+        }
+    }
+    let len = length(pull);
+    if (len < 1e-4) {
+        return vec2f(0.0);
+    }
+    return pull / len * min(best, 1.0);
+}
+
+fn bite_size(k: u32) -> u32 {
+    return u32(params.eat_rate * kind_rate(k) * params.dt * f32(FULL) + 0.5);
+}
+
+// Simulates agent `i`; returns (food eaten, 1 if it died this step).
+fn simulate(i: u32) -> vec2u {
     var a = agents[i];
     if ((a.flags & ALIVE) == 0u) {
         agents_next[i] = a;
-        return;
+        return vec2u(0u);
     }
 
     let cc = vec2i(cell_coord(a.pos));
@@ -211,6 +358,15 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
         acc += (vel_sum * inv - a.vel) * params.align_strength;
         acc += (pos_sum * inv - a.pos) * params.cohesion_strength;
     }
+    // Forage: drift toward the richest food nearby, so the swarm flows over
+    // whatever the player steers it onto instead of milling on bare floor.
+    acc += forage(a.pos, a.seed) * params.forage_strength;
+    // The Queen's body: critters make room around her.
+    let from_queen = a.pos - params.queen_pos;
+    let dq = length(from_queen);
+    if (dq < params.queen_radius && dq > 1e-4) {
+        acc += (from_queen / dq) * (1.0 - dq / params.queen_radius) * 80.0;
+    }
     // Per-critter wander keeps the swarm alive when it is at rest.
     let wander = a.seed * 6.2831853 + params.time * (0.7 + a.seed);
     acc += vec2f(cos(wander), sin(wander)) * 1.5;
@@ -222,36 +378,107 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     if (speed > vmax) {
         a.vel *= vmax / speed;
     }
-    a.pos += a.vel * params.dt;
+
+    // Move, sliding along walls and uneaten solids. A critter already inside
+    // something (e.g. hatched over it) may move freely so it can get out.
+    let old = a.pos;
+    var np = old + a.vel * params.dt;
+    if (blocked(np) && !blocked(old)) {
+        let px = vec2f(np.x, old.y);
+        let py = vec2f(old.x, np.y);
+        if (!blocked(px)) {
+            np = px;
+            a.vel.y *= -0.2;
+        } else if (!blocked(py)) {
+            np = py;
+            a.vel.x *= -0.2;
+        } else {
+            np = old;
+            a.vel *= -0.2;
+        }
+    }
+    np = clamp(np, params.world_min, params.world_max);
+    a.pos = np;
     a.crowding = crowding;
 
-    // Walls: clamp and bleed off velocity into them.
-    if (a.pos.x < params.world_min.x) {
-        a.pos.x = params.world_min.x;
-        a.vel.x = abs(a.vel.x) * 0.3;
+    // Eat: loose food underfoot, and solid food the critter is pushing into.
+    var eaten = 0u;
+    let here = mat_cell(np);
+    if (here >= 0) {
+        let k = mat_kind[here];
+        let f = kind_flags(k);
+        if ((f & FLAG_EDIBLE) != 0u && (f & FLAG_SOLID) == 0u) {
+            eaten += bite(here, bite_size(k));
+        }
     }
-    if (a.pos.x > params.world_max.x) {
-        a.pos.x = params.world_max.x;
-        a.vel.x = -abs(a.vel.x) * 0.3;
+    var heading = a.vel;
+    if (length(heading) < 1e-3) {
+        heading = to_focal;
     }
-    if (a.pos.y < params.world_min.y) {
-        a.pos.y = params.world_min.y;
-        a.vel.y = abs(a.vel.y) * 0.3;
+    if (length(heading) > 1e-4) {
+        let ahead = mat_cell(np + normalize(heading) * params.mat_cell * 0.9);
+        if (ahead >= 0 && ahead != here) {
+            let k = mat_kind[ahead];
+            let f = kind_flags(k);
+            if ((f & FLAG_EDIBLE) != 0u && (f & FLAG_SOLID) != 0u) {
+                eaten += bite(ahead, bite_size(k));
+            }
+        }
     }
-    if (a.pos.y > params.world_max.y) {
-        a.pos.y = params.world_max.y;
-        a.vel.y = -abs(a.vel.y) * 0.3;
+
+    // Hazards kill on contact.
+    var died = 0u;
+    if (params.hazard_active != 0u && distance(np, params.hazard_pos) < params.hazard_radius) {
+        a.flags &= ~ALIVE;
+        died = 1u;
     }
     agents_next[i] = a;
+    return vec2u(eaten, died);
+}
+
+@compute @workgroup_size(256)
+fn main(
+    @builtin(global_invocation_id) gid: vec3u,
+    @builtin(local_invocation_index) t: u32,
+) {
+    let i = gid.x;
+    var result = vec2u(0u);
+    if (i < atomicLoad(&counters[LIVE_END])) {
+        result = simulate(i);
+    }
+    if (result.x > 0u) {
+        atomicAdd(&wg_eaten, result.x);
+    }
+    if (result.y > 0u) {
+        atomicAdd(&wg_died, result.y);
+    }
+    // One global atomic per workgroup instead of one per critter.
+    workgroupBarrier();
+    if (t == 0u) {
+        let e = atomicLoad(&wg_eaten);
+        if (e > 0u) {
+            atomicAdd(&counters[EATEN], e);
+        }
+        let d = atomicLoad(&wg_died);
+        if (d > 0u) {
+            atomicAdd(&counters[DIED], d);
+        }
+    }
 }
 
 //! pass:reduce
-// Per-workgroup sums of (position, alive count) for the CPU to read back
-// asynchronously: the swarm's centre without stalling the GPU.
+// Per-workgroup sums for the CPU to read back asynchronously: the swarm's
+// state without stalling the GPU. Two vec4s per workgroup:
+//   [0] = (main-body x sum, main-body y sum, main-body count, alive count)
+//   [1] = (near the Queen, 0, 0, 0)
+// The main body is the critters near the focal point, so stragglers stuck
+// elsewhere do not drag the Queen and camera off the swarm.
 @group(0) @binding(1) var<storage, read> agents: array<Agent>;
 @group(0) @binding(2) var<storage, read_write> partials: array<vec4f>;
+@group(0) @binding(3) var<storage, read> counters: array<u32>;
 
-var<workgroup> acc: array<vec4f, 256>;
+var<workgroup> acc_a: array<vec4f, 256>;
+var<workgroup> acc_b: array<vec4f, 256>;
 
 @compute @workgroup_size(256)
 fn main(
@@ -259,22 +486,28 @@ fn main(
     @builtin(local_invocation_index) t: u32,
     @builtin(workgroup_id) wg: vec3u,
 ) {
-    var v = vec4f(0.0);
-    if (gid.x < params.agent_count) {
+    var a4 = vec4f(0.0);
+    var b4 = vec4f(0.0);
+    if (gid.x < counters[LIVE_END]) {
         let a = agents[gid.x];
         if ((a.flags & ALIVE) != 0u) {
-            v = vec4f(a.pos, 1.0, 0.0);
+            let in_body = distance(a.pos, params.focal) < params.body_radius;
+            a4 = select(vec4f(0.0, 0.0, 0.0, 1.0), vec4f(a.pos, 1.0, 1.0), in_body);
+            b4.x = select(0.0, 1.0, distance(a.pos, params.queen_pos) < params.guard_radius);
         }
     }
-    acc[t] = v;
+    acc_a[t] = a4;
+    acc_b[t] = b4;
     workgroupBarrier();
     for (var s = 128u; s > 0u; s >>= 1u) {
         if (t < s) {
-            acc[t] += acc[t + s];
+            acc_a[t] += acc_a[t + s];
+            acc_b[t] += acc_b[t + s];
         }
         workgroupBarrier();
     }
     if (t == 0u) {
-        partials[wg.x] = acc[0];
+        partials[wg.x * 2u] = acc_a[0];
+        partials[wg.x * 2u + 1u] = acc_b[0];
     }
 }
