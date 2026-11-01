@@ -1,4 +1,4 @@
-//! Windowless runs: scripted steering, timing, stats and an optional PNG.
+//! Windowless runs: a scripted player, timing, stats and an optional PNG.
 //! Used for benchmarks, CI smoke tests and screenshots.
 
 use std::fmt;
@@ -10,7 +10,9 @@ use glam::Vec2;
 
 use crate::game::Controls;
 use crate::gpu::Gpu;
-use crate::session::{Session, SessionConfig};
+use crate::level;
+use crate::run::{Run, RunConfig, RunState};
+use crate::session::{SIM_DT, Session, SessionConfig};
 use crate::sim::stats::SwarmStats;
 
 #[derive(Clone, Debug)]
@@ -21,18 +23,21 @@ pub struct HeadlessOptions {
     pub width: u32,
     pub height: u32,
     pub seed: u64,
+    /// Include the mop hazard (off by default so scripted runs are stable).
+    pub hazard: bool,
     pub screenshot: Option<PathBuf>,
 }
 
 impl Default for HeadlessOptions {
     fn default() -> Self {
         Self {
-            agents: 20_000,
+            agents: 10,
             capacity: 32_768,
-            frames: 600,
+            frames: 3_600,
             width: 1280,
             height: 720,
             seed: 1,
+            hazard: false,
             screenshot: None,
         }
     }
@@ -41,20 +46,27 @@ impl Default for HeadlessOptions {
 #[derive(Debug)]
 pub struct HeadlessReport {
     pub adapter: String,
-    pub agents: u32,
     pub frames: u32,
     pub ms_per_step: f64,
     pub stats: SwarmStats,
+    pub mass: u32,
+    pub peak_mass: u32,
+    pub eaten_fraction: f64,
+    pub queen_alive: bool,
     pub screenshot: Option<PathBuf>,
 }
 
 impl fmt::Display for HeadlessReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "adapter: {}", self.adapter)?;
+        writeln!(f, "{} steps: {:.3} ms/step", self.frames, self.ms_per_step)?;
         writeln!(
             f,
-            "simulated {} agents for {} steps: {:.3} ms/step",
-            self.agents, self.frames, self.ms_per_step
+            "run: mass {} (peak {}) | {:.1}% of the kitchen eaten | queen {}",
+            self.mass,
+            self.peak_mass,
+            self.eaten_fraction * 100.0,
+            if self.queen_alive { "alive" } else { "fallen" }
         )?;
         write!(f, "swarm: {}", self.stats)?;
         if let Some(path) = &self.screenshot {
@@ -64,13 +76,72 @@ impl fmt::Display for HeadlessReport {
     }
 }
 
-/// A figure-eight steering path, so headless runs exercise real flow.
-pub fn scripted_controls(time: f32, center: Vec2) -> Controls {
-    let target = center + Vec2::new(40.0 * (time * 0.25).sin(), 25.0 * (time * 0.5).sin());
-    Controls {
-        pointer: Some(target),
-        gather: if (time * 0.2).sin() > 0.6 { 1.0 } else { 0.0 },
-        ..Default::default()
+/// A scripted player: tours the level's food. At each spot it waits for the
+/// swarm to arrive, eats until the food runs dry, then moves on.
+pub struct Script {
+    tour: Vec<Vec2>,
+    index: usize,
+    /// Seconds spent at the current spot since arriving.
+    dwell: f32,
+    /// Seconds since setting off for the current spot.
+    travel: f32,
+    /// Food eaten when the last progress check happened, and when that was.
+    last_food: f64,
+    since_progress: f32,
+}
+
+impl Script {
+    /// Leave once nothing new has been eaten for this long.
+    const STARVED: f32 = 2.5;
+    /// Give up on a spot after this long, arrived or not.
+    const MAX_TIME: f32 = 30.0;
+
+    pub fn new(start: Vec2, food: &[Vec2]) -> Self {
+        Self {
+            tour: level::tour(start, food),
+            index: 0,
+            dwell: 0.0,
+            travel: 0.0,
+            last_food: 0.0,
+            since_progress: 0.0,
+        }
+    }
+
+    pub fn target(&self) -> Option<Vec2> {
+        self.tour.get(self.index).copied()
+    }
+
+    pub fn controls(&mut self, run: &Run, dt: f32) -> Controls {
+        let Some(target) = self.target() else {
+            return Controls::default();
+        };
+        self.travel += dt;
+        let arrived = run
+            .game
+            .swarm_center
+            .is_some_and(|c| c.distance(target) < run.game.swarm_radius + 4.0);
+        if arrived {
+            self.dwell += dt;
+        }
+        let food = run.colony.food_eaten;
+        if food > self.last_food + 0.5 {
+            self.last_food = food;
+            self.since_progress = 0.0;
+        } else {
+            self.since_progress += dt;
+        }
+        let done = (arrived && self.dwell > 2.0 && self.since_progress > Self::STARVED)
+            || self.travel > Self::MAX_TIME;
+        if done {
+            self.index = (self.index + 1) % self.tour.len();
+            self.dwell = 0.0;
+            self.travel = 0.0;
+            self.since_progress = 0.0;
+        }
+        Controls {
+            pointer: Some(target),
+            ..Default::default()
+        }
     }
 }
 
@@ -80,29 +151,48 @@ pub fn run(opts: &HeadlessOptions) -> Result<HeadlessReport> {
     let gpu = Gpu::headless()?;
     log::info!("adapter: {}", gpu.adapter_summary());
     let cfg = SessionConfig {
-        initial_agents: opts.agents,
-        capacity: opts.capacity.max(opts.agents),
+        run: RunConfig {
+            initial_critters: opts.agents,
+            capacity: opts.capacity.max(opts.agents),
+            hazard_delay: opts.hazard.then_some(20.0),
+        },
         seed: opts.seed,
-        ..Default::default()
     };
     let aspect = opts.width as f32 / opts.height.max(1) as f32;
     let mut session = Session::new(&gpu, CAPTURE_FORMAT, aspect, &cfg);
-    let center = (cfg.bounds.min + cfg.bounds.max) * 0.5;
+    let mut script = Script::new(session.level.queen_start, &session.level.food_spots);
 
     gpu.wait_idle();
     let start = Instant::now();
     for _ in 0..opts.frames {
-        let controls = scripted_controls(session.game.time, center);
+        let controls = script.controls(&session.run, SIM_DT);
         session.step(&gpu, &controls);
-        session
-            .game
-            .update_camera(session.swarm.count(), crate::session::SIM_DT);
+        if session.swarm.steps().is_multiple_of(300) {
+            let r = &session.run;
+            log::debug!(
+                "t={:.0}s target={:?} center={:?} focal={} food={:.1} mass={} queen={}",
+                r.elapsed,
+                script.target(),
+                r.game.swarm_center,
+                r.game.focal,
+                r.colony.food_eaten,
+                r.colony.mass(),
+                r.queen.pos,
+            );
+        }
+        session.update_camera(SIM_DT);
     }
     gpu.wait_idle();
     let elapsed = start.elapsed().as_secs_f64();
+    // Let the last readbacks land so the report is current.
+    session.step(&gpu, &Controls::default());
+    gpu.wait_idle();
+    if let Some(s) = session.swarm.summary(&gpu) {
+        session.run.observe(&s, session.swarm.tuning.rest_density);
+    }
 
     let agents = session.swarm.read_agents(&gpu)?;
-    let stats = SwarmStats::compute(&agents, session.game.focal, session.swarm.bounds());
+    let stats = SwarmStats::compute(&agents, session.run.game.focal, session.swarm.bounds());
 
     let screenshot = match &opts.screenshot {
         Some(path) => {
@@ -118,9 +208,9 @@ pub fn run(opts: &HeadlessOptions) -> Result<HeadlessReport> {
         None => None,
     };
 
+    let run = &session.run;
     Ok(HeadlessReport {
         adapter: gpu.adapter_summary(),
-        agents: session.swarm.count(),
         frames: opts.frames,
         ms_per_step: if opts.frames > 0 {
             elapsed * 1000.0 / opts.frames as f64
@@ -128,11 +218,14 @@ pub fn run(opts: &HeadlessOptions) -> Result<HeadlessReport> {
             0.0
         },
         stats,
+        mass: run.colony.mass(),
+        peak_mass: run.colony.peak_mass,
+        eaten_fraction: run.eaten_fraction(),
+        queen_alive: run.state == RunState::Playing,
         screenshot,
     })
 }
 
-/// Renders the current frame offscreen and returns it as an image.
 pub fn capture(gpu: &Gpu, session: &Session, width: u32, height: u32) -> Result<image::RgbaImage> {
     assert_eq!(session.renderer.format(), CAPTURE_FORMAT);
     let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
@@ -150,7 +243,7 @@ pub fn capture(gpu: &Gpu, session: &Session, width: u32, height: u32) -> Result<
         view_formats: &[],
     });
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-    session.draw(gpu, &view, height);
+    session.draw(gpu, &view, width, height);
 
     let row = width * 4;
     let padded_row =

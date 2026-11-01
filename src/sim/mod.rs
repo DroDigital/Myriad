@@ -1,19 +1,23 @@
-//! GPU swarm simulation: spatial-hash flocking toward the player's focal point.
+//! GPU swarm simulation: spatial-hash flocking toward the player's focal point,
+//! eating the material grid, hatching at the Queen, dying to hazards.
 //!
-//! Each step runs four compute passes (see `passes.wgsl`):
+//! Each step runs these compute passes (see `passes.wgsl`):
+//! 0. **hatch_revive / hatch_append** (when hatching): place newborns at the
+//!    Queen, reusing dead slots first, then extending the live range
 //! 1. **count**: bucket living agents into grid cells (atomic per-cell counters)
 //! 2. **scan**: exclusive prefix sum of the counters into cell start offsets
 //! 3. **scatter**: write agent indices into a list sorted by cell
 //! 4. **steer**: each agent samples its 3x3 neighbourhood (an equal, unbiased
-//!    budget per cell), steers, integrates
-//!
+//!    budget per cell), steers, moves with collision, eats, may die
 //! 5. **reduce**: per-workgroup sums, read back asynchronously (see [`feedback`])
 //!
-//! Gameplay never reads the agents back per frame: it gets a small summary one
-//! or two frames late through [`Swarm::summary`]. [`Swarm::read_agents`] blocks
-//! and exists for tests, stats and tooling.
+//! The GPU owns the population: a small `counters` buffer holds the live range
+//! and cumulative hatched/eaten/died totals. The CPU asks for hatchlings and
+//! learns what happened one or two frames later through [`Swarm::summary`];
+//! it never blocks. [`Swarm::read_agents`] blocks and exists for tests and tools.
 
 pub mod feedback;
+pub mod material;
 pub mod stats;
 
 use bytemuck::{Pod, Zeroable};
@@ -22,10 +26,21 @@ use glam::Vec2;
 use crate::gpu::Gpu;
 use crate::util::SplitMix64;
 use feedback::{Feedback, SwarmSummary};
+use material::MaterialGrid;
 
 pub const WORKGROUP_SIZE: u32 = 256;
 pub const AGENT_ALIVE: u32 = 1;
 pub const INVALID_CELL: u32 = u32::MAX;
+
+/// Indices into the GPU `counters` buffer. Must match `common.wgsl`.
+pub mod counter {
+    pub const LIVE_END: usize = 0;
+    pub const HATCHED: usize = 1;
+    pub const EATEN: usize = 2;
+    pub const DIED: usize = 3;
+    pub const TICKETS: usize = 4;
+    pub const COUNT: usize = 8;
+}
 
 const COMMON_WGSL: &str = include_str!("common.wgsl");
 const PASSES_WGSL: &str = include_str!("passes.wgsl");
@@ -80,7 +95,7 @@ pub struct SimParams {
     pub grid_dim: [u32; 2],
     pub cell_size: f32,
     pub dt: f32,
-    pub agent_count: u32,
+    pub capacity: u32,
     pub cell_count: u32,
     pub time: f32,
     pub gather: f32,
@@ -96,7 +111,21 @@ pub struct SimParams {
     pub slow_radius: f32,
     pub pressure_strength: f32,
     pub rest_density: f32,
-    pub _pad: [f32; 2],
+    pub eat_rate: f32,
+    pub hatch_count: u32,
+    pub queen_pos: [f32; 2],
+    pub queen_radius: f32,
+    pub guard_radius: f32,
+    pub hazard_pos: [f32; 2],
+    pub hazard_radius: f32,
+    pub hazard_active: u32,
+    pub mat_dim: [u32; 2],
+    pub mat_cell: f32,
+    pub step: u32,
+    pub forage_strength: f32,
+    pub forage_radius: f32,
+    pub body_radius: f32,
+    pub _pad: f32,
 }
 
 /// Feel knobs for the swarm. Tweaked by Gather/Spread each step.
@@ -118,6 +147,14 @@ pub struct SwarmTuning {
     pub pressure_strength: f32,
     /// Comfortable critters per unit area; crowding above this builds pressure.
     pub rest_density: f32,
+    /// Material cells a critter eats per second (before the kind's rate).
+    pub eat_rate: f32,
+    /// Critters within this distance of the Queen count as her guard.
+    pub guard_radius: f32,
+    /// Pull toward nearby food.
+    pub forage_strength: f32,
+    /// How far critters sense food, in world units.
+    pub forage_radius: f32,
 }
 
 impl Default for SwarmTuning {
@@ -134,6 +171,10 @@ impl Default for SwarmTuning {
             slow_radius: 4.0,
             pressure_strength: 200.0,
             rest_density: 2.5,
+            eat_rate: 0.5,
+            guard_radius: 4.0,
+            forage_strength: 14.0,
+            forage_radius: 3.0,
         }
     }
 }
@@ -155,6 +196,13 @@ impl WorldBounds {
     }
 }
 
+/// A circular danger zone that kills critters on contact.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HazardZone {
+    pub center: Vec2,
+    pub radius: f32,
+}
+
 /// Per-step inputs from gameplay.
 #[derive(Clone, Copy, Debug)]
 pub struct SimFrame {
@@ -163,6 +211,28 @@ pub struct SimFrame {
     pub gather: f32,
     pub dt: f32,
     pub time: f32,
+    /// Hatchlings to place at the Queen this step.
+    pub hatch: u32,
+    pub queen_pos: Vec2,
+    /// The Queen's body: critters keep out of it; hatchlings appear around it.
+    pub queen_radius: f32,
+    pub hazard: Option<HazardZone>,
+}
+
+impl SimFrame {
+    /// A frame with no Queen, hazards or hatching: just steering.
+    pub fn steer(focal: Vec2, dt: f32, time: f32) -> Self {
+        Self {
+            focal,
+            gather: 0.0,
+            dt,
+            time,
+            hatch: 0,
+            queen_pos: Vec2::splat(f32::MAX),
+            queen_radius: 1.0,
+            hazard: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -188,10 +258,25 @@ struct Pass {
     bind_group: wgpu::BindGroup,
 }
 
+struct Passes {
+    hatch_revive: Pass,
+    hatch_append: Pass,
+    count: Pass,
+    scan: Pass,
+    scatter: Pass,
+    steer: Pass,
+    reduce: Pass,
+}
+
 pub struct Swarm {
     config: SwarmConfig,
     grid_dim: [u32; 2],
-    count: u32,
+    mat_dim: [u32; 2],
+    mat_cell: f32,
+    /// Agents placed from the CPU before the first step.
+    spawned: u32,
+    /// Latest known living count (from feedback, or the initial spawn).
+    alive_hint: u32,
     pub tuning: SwarmTuning,
     params: wgpu::Buffer,
     agents: wgpu::Buffer,
@@ -200,16 +285,22 @@ pub struct Swarm {
     starts: wgpu::Buffer,
     agent_cell: wgpu::Buffer,
     sorted: wgpu::Buffer,
+    counters: wgpu::Buffer,
     partials: wgpu::Buffer,
-    passes: [Pass; 5],
+    passes: Passes,
     feedback: Feedback,
     steps: u64,
 }
 
 impl Swarm {
-    pub fn new(device: &wgpu::Device, config: SwarmConfig) -> Self {
+    pub fn new(gpu: &Gpu, config: SwarmConfig, material: &MaterialGrid) -> Self {
         assert!(config.capacity > 0, "swarm capacity must be positive");
         assert!(config.cell_size > 0.0, "cell size must be positive");
+        assert_eq!(
+            material.bounds, config.bounds,
+            "material grid and swarm must cover the same world"
+        );
+        let device = &gpu.device;
         let size = config.bounds.size();
         let grid_dim = [
             (size.x / config.cell_size).ceil().max(1.0) as u32,
@@ -242,34 +333,62 @@ impl Swarm {
         let agent_cell = storage("agent cell", cap * 4);
         let agent_local = storage("agent local", cap * 4);
         let sorted = storage("sorted agents", cap * 4);
-        let partials_bytes = config.capacity.div_ceil(WORKGROUP_SIZE) as u64 * 16;
+        let counters = storage("counters", counter::COUNT as u64 * 4);
+        let partials_bytes = config.capacity.div_ceil(WORKGROUP_SIZE) as u64 * 32;
         let partials = storage("reduce partials", partials_bytes);
 
-        let passes = [
-            make_pass(
-                device,
+        let mp = |name: &str, buffers: &[&wgpu::Buffer]| make_pass(device, name, buffers);
+        let passes = Passes {
+            hatch_revive: mp("hatch_revive", &[&params, &agents, &counters]),
+            hatch_append: mp("hatch_append", &[&params, &agents, &counters]),
+            count: mp(
                 "count",
-                &[&params, &agents, &counts, &agent_cell, &agent_local],
+                &[
+                    &params,
+                    &agents,
+                    &counts,
+                    &agent_cell,
+                    &agent_local,
+                    &counters,
+                ],
             ),
-            make_pass(device, "scan", &[&params, &counts, &starts]),
-            make_pass(
-                device,
+            scan: mp("scan", &[&params, &counts, &starts]),
+            scatter: mp(
                 "scatter",
-                &[&params, &agent_cell, &agent_local, &starts, &sorted],
+                &[
+                    &params,
+                    &agent_cell,
+                    &agent_local,
+                    &starts,
+                    &sorted,
+                    &counters,
+                ],
             ),
-            make_pass(
-                device,
+            steer: mp(
                 "steer",
-                &[&params, &agents, &agents_next, &counts, &starts, &sorted],
+                &[
+                    &params,
+                    &agents,
+                    &agents_next,
+                    &counts,
+                    &starts,
+                    &sorted,
+                    &counters,
+                    &material.amounts,
+                    &material.kinds,
+                ],
             ),
-            make_pass(device, "reduce", &[&params, &agents, &partials]),
-        ];
+            reduce: mp("reduce", &[&params, &agents, &partials, &counters]),
+        };
         let feedback = Feedback::new(device, partials_bytes);
 
         Self {
             config,
             grid_dim,
-            count: 0,
+            mat_dim: material.dim,
+            mat_cell: material.cell,
+            spawned: 0,
+            alive_hint: 0,
             tuning: SwarmTuning::default(),
             params,
             agents,
@@ -278,15 +397,12 @@ impl Swarm {
             starts,
             agent_cell,
             sorted,
+            counters,
             partials,
             passes,
             feedback,
             steps: 0,
         }
-    }
-
-    pub fn count(&self) -> u32 {
-        self.count
     }
 
     pub fn capacity(&self) -> u32 {
@@ -301,19 +417,31 @@ impl Swarm {
         self.grid_dim
     }
 
-    /// The agent storage buffer, for rendering.
+    /// Latest known number of living critters (one or two frames old).
+    pub fn alive_hint(&self) -> u32 {
+        self.alive_hint
+    }
+
+    /// The agent storage buffer, for rendering. Draw `capacity()` instances;
+    /// dead and unused slots render as nothing.
     pub fn agents_buffer(&self) -> &wgpu::Buffer {
         &self.agents
     }
 
-    /// Appends agents, up to capacity. Returns how many were added.
+    /// Places agents directly, up to capacity. Only valid before the first
+    /// step; afterwards the GPU owns the population (use `SimFrame::hatch`).
+    /// Returns how many were added.
     pub fn spawn(&mut self, queue: &wgpu::Queue, new_agents: &[Agent]) -> usize {
-        let room = (self.config.capacity - self.count) as usize;
+        assert_eq!(self.steps, 0, "spawn() is only valid before the first step");
+        let room = (self.config.capacity - self.spawned) as usize;
         let n = new_agents.len().min(room);
         if n > 0 {
-            let offset = self.count as u64 * size_of::<Agent>() as u64;
+            let offset = self.spawned as u64 * size_of::<Agent>() as u64;
             queue.write_buffer(&self.agents, offset, bytemuck::cast_slice(&new_agents[..n]));
-            self.count += n as u32;
+            self.spawned += n as u32;
+            self.alive_hint = self.spawned;
+            let live_end = (counter::LIVE_END * 4) as u64;
+            queue.write_buffer(&self.counters, live_end, bytemuck::bytes_of(&self.spawned));
         }
         n
     }
@@ -325,6 +453,10 @@ impl Swarm {
         let gather = g.max(0.0);
         let spread = (-g).max(0.0);
         let cell = self.config.cell_size;
+        let hazard = frame.hazard.unwrap_or(HazardZone {
+            center: Vec2::ZERO,
+            radius: 0.0,
+        });
         SimParams {
             focal: frame.focal.to_array(),
             world_min: self.config.bounds.min.to_array(),
@@ -332,7 +464,7 @@ impl Swarm {
             grid_dim: self.grid_dim,
             cell_size: cell,
             dt: frame.dt,
-            agent_count: self.count,
+            capacity: self.config.capacity,
             cell_count: self.grid_dim[0] * self.grid_dim[1],
             time: frame.time,
             gather: g,
@@ -351,19 +483,30 @@ impl Swarm {
             // disk instead of a crush at the focal point.
             slow_radius: t
                 .slow_radius
-                .max(rest_radius(self.count, t.rest_density) * 0.8),
-            // Gather packs critters tighter; Spread loosens them.
+                .max(rest_radius(self.alive_hint, t.rest_density) * 0.8),
             pressure_strength: t.pressure_strength,
+            // Gather packs critters tighter; Spread loosens them.
             rest_density: t.rest_density * (1.0 + 1.5 * gather) * (1.0 - 0.6 * spread),
-            _pad: [0.0; 2],
+            eat_rate: t.eat_rate,
+            hatch_count: frame.hatch,
+            queen_pos: frame.queen_pos.to_array(),
+            queen_radius: frame.queen_radius,
+            guard_radius: t.guard_radius,
+            hazard_pos: hazard.center.to_array(),
+            hazard_radius: hazard.radius,
+            hazard_active: frame.hazard.is_some() as u32,
+            mat_dim: self.mat_dim,
+            mat_cell: self.mat_cell,
+            step: self.steps as u32,
+            forage_strength: t.forage_strength,
+            forage_radius: t.forage_radius,
+            body_radius: rest_radius(self.alive_hint, t.rest_density) * 2.0 + 8.0,
+            _pad: 0.0,
         }
     }
 
     /// Runs one simulation step and submits it.
     pub fn step(&mut self, gpu: &Gpu, frame: &SimFrame) {
-        if self.count == 0 {
-            return;
-        }
         self.steps += 1;
         let params = self.params_for(frame);
         gpu.queue
@@ -373,14 +516,13 @@ impl Swarm {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("swarm step"),
             });
-        self.encode_step(&mut encoder);
-        let bytes = self.partials_bytes();
-        let slot = self
-            .feedback
-            .record_copy(&mut encoder, &self.partials, bytes, self.steps);
+        self.encode_step(&mut encoder, frame.hatch);
+        let slot =
+            self.feedback
+                .record_copy(&mut encoder, &self.counters, &self.partials, self.steps);
         gpu.queue.submit([encoder.finish()]);
         if let Some(slot) = slot {
-            self.feedback.after_submit(slot, bytes);
+            self.feedback.after_submit(slot);
         }
     }
 
@@ -389,64 +531,67 @@ impl Swarm {
         self.steps
     }
 
-    fn partials_bytes(&self) -> u64 {
-        self.count.div_ceil(WORKGROUP_SIZE) as u64 * 16
-    }
-
     /// Collects finished readbacks without blocking and returns the newest
     /// summary (usually one or two steps old). `None` until the first arrives.
     pub fn summary(&mut self, gpu: &Gpu) -> Option<SwarmSummary> {
-        let bytes = self.partials_bytes();
-        self.feedback.poll(&gpu.device, bytes)
+        let s = self.feedback.poll(&gpu.device);
+        if let Some(s) = s {
+            self.alive_hint = s.alive;
+        }
+        s
     }
 
-    fn encode_step(&self, encoder: &mut wgpu::CommandEncoder) {
-        let agent_groups = self.count.div_ceil(WORKGROUP_SIZE);
+    fn encode_step(&self, encoder: &mut wgpu::CommandEncoder, hatch: u32) {
+        let groups = self.config.capacity.div_ceil(WORKGROUP_SIZE);
+        let tickets = (counter::TICKETS * 4) as u64;
+        encoder.clear_buffer(&self.counters, tickets, Some(4));
         encoder.clear_buffer(&self.counts, 0, None);
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("swarm"),
                 timestamp_writes: None,
             });
-            let [count, scan, scatter, steer, _] = &self.passes;
-            for (p, groups) in [
-                (count, agent_groups),
-                (scan, 1),
-                (scatter, agent_groups),
-                (steer, agent_groups),
-            ] {
-                pass.set_pipeline(&p.pipeline);
-                pass.set_bind_group(0, &p.bind_group, &[]);
+            let p = &self.passes;
+            let mut run = |pass_: &Pass, groups: u32| {
+                pass.set_pipeline(&pass_.pipeline);
+                pass.set_bind_group(0, &pass_.bind_group, &[]);
                 pass.dispatch_workgroups(groups, 1, 1);
+            };
+            if hatch > 0 {
+                run(&p.hatch_revive, groups);
+                run(&p.hatch_append, hatch.div_ceil(WORKGROUP_SIZE));
             }
+            run(&p.count, groups);
+            run(&p.scan, 1);
+            run(&p.scatter, groups);
+            run(&p.steer, groups);
         }
-        encoder.copy_buffer_to_buffer(
-            &self.agents_next,
-            0,
-            &self.agents,
-            0,
-            self.count as u64 * size_of::<Agent>() as u64,
-        );
+        encoder.copy_buffer_to_buffer(&self.agents_next, 0, &self.agents, 0, None);
         // Reduce the new state for the CPU (after the copy back).
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("swarm reduce"),
             timestamp_writes: None,
         });
-        let reduce = &self.passes[4];
-        pass.set_pipeline(&reduce.pipeline);
-        pass.set_bind_group(0, &reduce.bind_group, &[]);
-        pass.dispatch_workgroups(agent_groups, 1, 1);
+        pass.set_pipeline(&self.passes.reduce.pipeline);
+        pass.set_bind_group(0, &self.passes.reduce.bind_group, &[]);
+        pass.dispatch_workgroups(groups, 1, 1);
     }
 
-    /// Reads all agents back (blocking). For tests and stats only.
+    /// Reads every agent slot back (blocking). For tests and stats only;
+    /// filter with [`Agent::is_alive`].
     pub fn read_agents(&self, gpu: &Gpu) -> anyhow::Result<Vec<Agent>> {
-        gpu.read_buffer(&self.agents, self.count as usize)
+        gpu.read_buffer(&self.agents, self.config.capacity as usize)
+    }
+
+    /// Reads the counters back (blocking), indexed by [`counter`].
+    pub fn read_counters(&self, gpu: &Gpu) -> anyhow::Result<Vec<u32>> {
+        gpu.read_buffer(&self.counters, counter::COUNT)
     }
 
     /// Reads the spatial hash from the last step back (blocking).
     pub fn read_grid(&self, gpu: &Gpu) -> anyhow::Result<GridSnapshot> {
         let cells = (self.grid_dim[0] * self.grid_dim[1]) as usize;
-        let n = self.count as usize;
+        let n = self.config.capacity as usize;
         Ok(GridSnapshot {
             counts: gpu.read_buffer(&self.counts, cells)?,
             starts: gpu.read_buffer(&self.starts, cells)?,
@@ -464,7 +609,7 @@ impl Swarm {
     }
 }
 
-/// Radius of a disk holding `count` critters at `rest_density` per cell (cell = 1 unit).
+/// Radius of a disk holding `count` critters at `rest_density` per unit area.
 pub fn rest_radius(count: u32, rest_density: f32) -> f32 {
     (count as f32 / rest_density / std::f32::consts::PI).sqrt()
 }
@@ -482,7 +627,12 @@ fn pass_source(name: &str) -> &'static str {
 }
 
 fn make_pass(device: &wgpu::Device, name: &str, buffers: &[&wgpu::Buffer]) -> Pass {
-    let source = format!("{COMMON_WGSL}\n{}", pass_source(name));
+    log::debug!("building pass `{name}`");
+    let source = format!(
+        "{}\n{COMMON_WGSL}\n{}",
+        material::wgsl_kind_table(),
+        pass_source(name)
+    );
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(name),
         source: wgpu::ShaderSource::Wgsl(source.into()),
@@ -537,13 +687,35 @@ mod tests {
     #[test]
     fn gpu_struct_layouts_match_wgsl() {
         assert_eq!(size_of::<Agent>(), 32);
-        assert_eq!(size_of::<SimParams>(), 112);
+        assert_eq!(size_of::<SimParams>(), 176);
     }
 
     #[test]
     fn every_pass_section_exists() {
-        for name in ["count", "scan", "scatter", "steer", "reduce"] {
+        for name in [
+            "hatch_revive",
+            "hatch_append",
+            "count",
+            "scan",
+            "scatter",
+            "steer",
+            "reduce",
+        ] {
             assert!(pass_source(name).contains("fn main"), "{name}");
+        }
+    }
+
+    #[test]
+    fn counter_indices_match_wgsl() {
+        for (name, index) in [
+            ("LIVE_END", counter::LIVE_END),
+            ("HATCHED", counter::HATCHED),
+            ("EATEN", counter::EATEN),
+            ("DIED", counter::DIED),
+            ("TICKETS", counter::TICKETS),
+        ] {
+            let decl = format!("const {name}: u32 = {index}u;");
+            assert!(COMMON_WGSL.contains(&decl), "missing `{decl}`");
         }
     }
 

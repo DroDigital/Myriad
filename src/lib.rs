@@ -6,10 +6,16 @@
 pub mod app;
 pub mod camera;
 pub mod cli;
+pub mod colony;
 pub mod game;
 pub mod gpu;
+pub mod hazard;
 pub mod headless;
+pub mod hud;
+pub mod level;
+pub mod queen;
 pub mod render;
+pub mod run;
 pub mod session;
 pub mod sim;
 pub mod util;

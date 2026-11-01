@@ -1,12 +1,15 @@
-//! One running game: swarm + renderer + gameplay state, driven at a fixed
-//! timestep. Shared by the window app and headless runs.
+//! One running game: GPU swarm + material + renderer + the run's rules,
+//! driven at a fixed timestep. Shared by the window app and headless runs.
 
-use glam::Vec2;
-
-use crate::game::{Controls, Game};
+use crate::game::Controls;
 use crate::gpu::Gpu;
-use crate::render::Renderer;
-use crate::sim::{Swarm, SwarmConfig, WorldBounds, rest_radius, spawn_disk};
+use crate::hud;
+use crate::level::Level;
+use crate::queen::QueenState;
+use crate::render::{FrameData, OverlayUniform, Renderer};
+use crate::run::{Run, RunConfig};
+use crate::sim::material::MaterialGrid;
+use crate::sim::{Swarm, SwarmConfig, spawn_disk};
 use crate::util::SplitMix64;
 
 /// Simulation rate. Rendering may run faster or slower.
@@ -16,75 +19,76 @@ pub const MAX_STEPS_PER_FRAME: u32 = 4;
 /// Distance between critters at spawn.
 const SPAWN_SPACING: f32 = 0.5;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct SessionConfig {
-    pub initial_agents: u32,
-    pub capacity: u32,
+    pub run: RunConfig,
     pub seed: u64,
-    pub bounds: WorldBounds,
-}
-
-impl Default for SessionConfig {
-    fn default() -> Self {
-        Self {
-            initial_agents: 2_000,
-            capacity: 32_768,
-            seed: 1,
-            // Prototype kitchen floor, in world units (one critter ~ 0.45).
-            bounds: WorldBounds {
-                min: Vec2::new(-120.0, -80.0),
-                max: Vec2::new(120.0, 80.0),
-            },
-        }
-    }
 }
 
 pub struct Session {
+    pub level: Level,
+    pub material: MaterialGrid,
     pub swarm: Swarm,
     pub renderer: Renderer,
-    pub game: Game,
-    rng: SplitMix64,
+    pub run: Run,
+    cfg: SessionConfig,
+    aspect: f32,
     accumulator: f32,
 }
 
 impl Session {
     pub fn new(gpu: &Gpu, format: wgpu::TextureFormat, aspect: f32, cfg: &SessionConfig) -> Self {
+        let level = Level::kitchen(cfg.seed);
+        let material = MaterialGrid::new(gpu, &level.material);
         let mut swarm = Swarm::new(
-            &gpu.device,
+            gpu,
             SwarmConfig {
-                capacity: cfg.capacity,
-                bounds: cfg.bounds,
+                capacity: cfg.run.capacity,
+                bounds: level.bounds(),
                 cell_size: 1.0,
             },
+            &material,
         );
-        let renderer = Renderer::new(&gpu.device, format, swarm.agents_buffer());
-        let start = (cfg.bounds.min + cfg.bounds.max) * 0.5;
-        let mut game = Game::new(cfg.bounds, start, aspect);
         let mut rng = SplitMix64::new(cfg.seed);
-        let initial = cfg.initial_agents.min(cfg.capacity) as usize;
+        let initial = cfg.run.initial_critters.min(cfg.run.capacity) as usize;
         swarm.spawn(
             &gpu.queue,
-            &spawn_disk(start, initial, SPAWN_SPACING, &mut rng),
+            &spawn_disk(level.queen_start, initial, SPAWN_SPACING, &mut rng),
         );
-        // Start already zoomed to fit, rather than easing out from the minimum.
-        game.camera.half_height = crate::camera::zoom_for_count(swarm.count());
+        let renderer = Renderer::new(
+            gpu,
+            format,
+            swarm.agents_buffer(),
+            swarm.capacity(),
+            &material,
+        );
+        let run = Run::new(&level, &cfg.run, aspect);
         Self {
+            level,
+            material,
             swarm,
             renderer,
-            game,
-            rng,
+            run,
+            cfg: *cfg,
+            aspect,
             accumulator: 0.0,
         }
     }
 
+    /// Starts a fresh run with the same settings.
+    pub fn restart(&mut self, gpu: &Gpu) {
+        let aspect = self.run.game.camera.aspect;
+        *self = Session::new(gpu, self.renderer.format(), aspect, &self.cfg);
+        self.aspect = aspect;
+    }
+
     /// Runs exactly one fixed simulation step.
     pub fn step(&mut self, gpu: &Gpu, controls: &Controls) {
-        self.game.update(controls, SIM_DT);
-        self.swarm.tuning.max_speed = self.game.swarm_speed();
-        self.swarm.step(gpu, &self.game.sim_frame(SIM_DT));
+        let frame = self.run.update(controls, SIM_DT);
+        self.swarm.tuning.max_speed = self.run.game.swarm_speed();
+        self.swarm.step(gpu, &frame);
         if let Some(summary) = self.swarm.summary(gpu) {
-            let radius = rest_radius(summary.alive, self.swarm.tuning.rest_density);
-            self.game.observe_swarm(summary.centroid, radius);
+            self.run.observe(&summary, self.swarm.tuning.rest_density);
         }
     }
 
@@ -100,20 +104,57 @@ impl Session {
         if steps == MAX_STEPS_PER_FRAME {
             self.accumulator = self.accumulator.min(SIM_DT);
         }
-        self.game.update_camera(self.swarm.count(), frame_dt);
+        self.update_camera(frame_dt);
         steps
     }
 
-    /// Hatches up to `n` new critters around the focal point.
-    pub fn hatch(&mut self, gpu: &Gpu, n: u32) -> usize {
-        let room = self.swarm.capacity() - self.swarm.count();
-        let n = n.min(room) as usize;
-        let agents = spawn_disk(self.game.focal, n, SPAWN_SPACING, &mut self.rng);
-        self.swarm.spawn(&gpu.queue, &agents)
+    pub fn update_camera(&mut self, dt: f32) {
+        self.run.game.update_camera(self.run.colony.alive, dt);
     }
 
-    pub fn draw(&self, gpu: &Gpu, target: &wgpu::TextureView, viewport_height: u32) {
-        let camera = self.game.camera_uniform(viewport_height);
-        self.renderer.draw(gpu, target, &camera, self.swarm.count());
+    /// Adds mass directly (developer cheat).
+    pub fn grant(&mut self, critters: f64) {
+        self.run.colony.grant(critters);
+    }
+
+    pub fn overlay(&self) -> OverlayUniform {
+        let q = &self.run.queen;
+        let (hazard_state, hazard_pos, hazard_warn) = match &self.run.mop {
+            Some(m) if m.is_active() => (2.0, m.pos, 1.0),
+            Some(m) if m.warning() > 0.0 => (1.0, m.pos, m.warning()),
+            _ => (0.0, glam::Vec2::ZERO, 0.0),
+        };
+        OverlayUniform {
+            queen_pos: q.pos.to_array(),
+            queen_heading: q.heading.to_array(),
+            queen_radius: crate::queen::QUEEN_RADIUS,
+            queen_health: q.health / crate::queen::MAX_HEALTH,
+            queen_flash: q.hurt_flash,
+            queen_state: match q.state {
+                QueenState::Healthy => 0.0,
+                QueenState::LastStand { .. } => 1.0,
+                QueenState::Dead => 2.0,
+            },
+            hazard_pos: hazard_pos.to_array(),
+            hazard_radius: crate::hazard::MOP_RADIUS,
+            hazard_state,
+            hazard_warn,
+            guard_radius: self.swarm.tuning.guard_radius,
+            _pad: [0.0; 2],
+        }
+    }
+
+    pub fn draw(&self, gpu: &Gpu, target: &wgpu::TextureView, width: u32, height: u32) {
+        let text = hud::build(&self.run, width as f32, height as f32);
+        let frame = FrameData {
+            camera: self
+                .run
+                .game
+                .camera_uniform(height, self.material.dim, self.material.cell),
+            overlay: self.overlay(),
+            glyphs: &text.glyphs,
+            viewport: [width, height],
+        };
+        self.renderer.draw(gpu, target, &frame);
     }
 }
