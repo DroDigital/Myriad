@@ -11,6 +11,7 @@ use bytemuck::{Pod, Zeroable};
 
 use crate::gpu::Gpu;
 use crate::sim::material::{MaterialGrid, wgsl_kind_table};
+use crate::sim::{MAX_THREATS, Threat};
 
 const SCENE_WGSL: &str = include_str!("scene.wgsl");
 /// HUD glyphs drawable per frame.
@@ -82,6 +83,7 @@ pub struct FrameData<'a> {
     pub overlay: OverlayUniform,
     pub glyphs: &'a [GlyphInstance],
     pub viewport: [u32; 2],
+    pub threats: [Threat; MAX_THREATS],
 }
 
 pub struct Renderer {
@@ -93,6 +95,7 @@ pub struct Renderer {
     text: wgpu::RenderPipeline,
     camera_buf: wgpu::Buffer,
     overlay_buf: wgpu::Buffer,
+    threats_buf: wgpu::Buffer,
     hud_buf: wgpu::Buffer,
     glyph_buf: wgpu::Buffer,
     ground_bind: wgpu::BindGroup,
@@ -159,6 +162,7 @@ impl Renderer {
         let camera_buf = uniform("camera", size_of::<CameraUniform>());
         let overlay_buf = uniform("overlay", size_of::<OverlayUniform>());
         let hud_buf = uniform("hud", size_of::<HudUniform>());
+        let threats_buf = uniform("threats", MAX_THREATS * size_of::<Threat>());
         let glyph_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("glyphs"),
             size: (MAX_GLYPHS * size_of::<GlyphInstance>()) as u64,
@@ -199,7 +203,11 @@ impl Renderer {
             ],
         );
         let agents_bind = bind("agents", &agents, &[(0, &camera_buf), (1, agents_buffer)]);
-        let overlay_bind = bind("overlay", &overlay, &[(0, &camera_buf), (4, &overlay_buf)]);
+        let overlay_bind = bind(
+            "overlay",
+            &overlay,
+            &[(0, &camera_buf), (4, &overlay_buf), (8, &threats_buf)],
+        );
         let text_bind = bind(
             "text",
             &text,
@@ -214,6 +222,7 @@ impl Renderer {
             text,
             camera_buf,
             overlay_buf,
+            threats_buf,
             hud_buf,
             glyph_buf,
             ground_bind,
@@ -232,6 +241,7 @@ impl Renderer {
         let q = &gpu.queue;
         q.write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(&frame.camera));
         q.write_buffer(&self.overlay_buf, 0, bytemuck::bytes_of(&frame.overlay));
+        q.write_buffer(&self.threats_buf, 0, bytemuck::cast_slice(&frame.threats));
         let hud = HudUniform {
             viewport: [frame.viewport[0] as f32, frame.viewport[1] as f32],
             time: frame.camera.time,

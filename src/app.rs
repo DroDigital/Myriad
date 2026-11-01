@@ -26,8 +26,8 @@ pub struct AppOptions {
     pub seed: u64,
     /// Enables developer keys.
     pub dev: bool,
-    /// Include the mop hazard.
-    pub hazard: bool,
+    /// Spawn threats and the Cleaner.
+    pub threats: bool,
 }
 
 pub fn run(opts: AppOptions) -> Result<()> {
@@ -60,6 +60,7 @@ struct Input {
     /// Presses waiting to be consumed by a simulation step.
     form: [bool; 2],
     cycle: [bool; 2],
+    start: bool,
     pad: PadState,
 }
 
@@ -90,6 +91,7 @@ impl Input {
             KeyCode::KeyX | KeyCode::KeyK => self.form[1] |= fresh,
             KeyCode::KeyQ => self.cycle[0] |= fresh,
             KeyCode::KeyE => self.cycle[1] |= fresh,
+            KeyCode::Enter | KeyCode::NumpadEnter => self.start |= fresh,
             _ => {}
         }
     }
@@ -100,6 +102,7 @@ impl Input {
             match ev.event {
                 EventType::ButtonPressed(b, _) => match b {
                     Button::South => self.form[0] = true,
+                    Button::Start => self.start = true,
                     Button::East => self.form[1] = true,
                     Button::West => self.pad.build = true,
                     Button::LeftTrigger => self.cycle[0] = true,
@@ -135,6 +138,7 @@ impl Input {
             pointer: cursor.filter(|_| self.mouse_down),
             form: self.form,
             cycle: self.cycle,
+            start: self.start,
             build: self.build_key || self.pad.build,
             // Aim with the stick if it is pushed, else at the cursor.
             aim: if stick != Vec2::ZERO {
@@ -149,6 +153,7 @@ impl Input {
     fn consume_presses(&mut self) {
         self.form = [false; 2];
         self.cycle = [false; 2];
+        self.start = false;
     }
 }
 
@@ -196,7 +201,9 @@ impl Running {
             run: RunConfig {
                 initial_critters: opts.agents,
                 capacity: opts.capacity.max(opts.agents),
-                hazard_delay: opts.hazard.then_some(30.0),
+                threats: opts.threats,
+                title: true,
+                ..Default::default()
             },
             seed: opts.seed,
         };
@@ -270,7 +277,7 @@ impl Running {
         if elapsed >= 0.5 {
             let fps = self.fps_frames as f32 / elapsed;
             self.window.set_title(&format!(
-                "Myriad | mass {} | {fps:.0} fps | WASD/mouse steer, Space gather, Shift spread, Z/X Forms, B build, R restart",
+                "Myriad | mass {} | {fps:.0} fps | WASD/mouse steer, Space gather, Shift spread, Z/X Forms, B build, Enter start, R restart",
                 self.session.run.colony.mass()
             ));
             self.fps_window_start = now;

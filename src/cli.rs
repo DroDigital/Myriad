@@ -15,9 +15,12 @@ Options:
   --capacity N       maximum critters (default 32768)
   --seed N           random seed (default 1)
   --dev              developer keys (H: +100 mass)
-  --no-hazard        windowed: leave the mop out
+  --no-threats       windowed: leave the threats out
   --headless         run without a window: a scripted player tours the food
-  --hazard           headless: include the mop
+  --threats          headless: include threats and the Cleaner
+  --boss-now         headless: bring the Cleaner at once
+  --passive          headless: the scripted player never fights
+  --bench            headless benchmark: 32768 critters, 600 steps
   --frames N         headless: simulation steps to run (default 3600)
   --width N          headless: screenshot width (default 1280)
   --height N         headless: screenshot height (default 720)
@@ -39,7 +42,7 @@ pub enum Command {
 pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command> {
     let mut headless = false;
     let mut dev = false;
-    let mut no_hazard = false;
+    let mut no_threats = false;
     let mut agents = None;
     let mut capacity = 32_768;
     let mut seed = 1;
@@ -51,8 +54,15 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command> {
             "-h" | "--help" => return Ok(Command::Help),
             "--headless" => headless = true,
             "--dev" => dev = true,
-            "--no-hazard" => no_hazard = true,
-            "--hazard" => h.hazard = true,
+            "--no-threats" => no_threats = true,
+            "--threats" => h.threats = true,
+            "--boss-now" => h.boss_now = true,
+            "--passive" => h.passive = true,
+            "--bench" => {
+                headless = true;
+                agents = Some(32_768);
+                h.frames = 600;
+            }
             "--agents" => agents = Some(number(&value("--agents")?)?),
             "--capacity" => capacity = number(&value("--capacity")?)?,
             "--seed" => seed = number(&value("--seed")?)?,
@@ -77,7 +87,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command> {
             capacity,
             seed,
             dev,
-            hazard: !no_hazard,
+            threats: !no_threats,
         }))
     }
 }
@@ -101,7 +111,7 @@ mod tests {
         match parse(args("")).unwrap() {
             Command::Windowed(o) => {
                 assert_eq!(o.agents, 10);
-                assert!(o.hazard && !o.dev);
+                assert!(o.threats && !o.dev);
             }
             other => panic!("{other:?}"),
         }
@@ -110,14 +120,14 @@ mod tests {
     #[test]
     fn headless_options() {
         match parse(args(
-            "--headless --hazard --agents 10_000 --frames 5 --screenshot out/a.png",
+            "--headless --threats --agents 10_000 --frames 5 --screenshot out/a.png",
         ))
         .unwrap()
         {
             Command::Headless(h) => {
                 assert_eq!(h.agents, 10_000);
                 assert_eq!(h.frames, 5);
-                assert!(h.hazard);
+                assert!(h.threats);
                 assert_eq!(h.screenshot.unwrap(), PathBuf::from("out/a.png"));
             }
             other => panic!("{other:?}"),

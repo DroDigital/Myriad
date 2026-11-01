@@ -33,6 +33,8 @@ pub struct Session {
     pub run: Run,
     cfg: SessionConfig,
     aspect: f32,
+    /// What the GPU was last told about threats, for drawing.
+    last_threats: [crate::sim::Threat; crate::sim::MAX_THREATS],
     accumulator: f32,
 }
 
@@ -71,6 +73,7 @@ impl Session {
             run,
             cfg: *cfg,
             aspect,
+            last_threats: Default::default(),
             accumulator: 0.0,
         }
     }
@@ -85,6 +88,7 @@ impl Session {
     /// Runs exactly one fixed simulation step.
     pub fn step(&mut self, gpu: &Gpu, controls: &Controls) {
         let frame = self.run.update(controls, SIM_DT);
+        self.last_threats = frame.threats;
         self.swarm.tuning.max_speed = self.run.game.swarm_speed();
         self.swarm.step(gpu, &frame);
         if let Some(summary) = self.swarm.summary(gpu) {
@@ -121,11 +125,6 @@ impl Session {
 
     pub fn overlay(&self) -> OverlayUniform {
         let q = &self.run.queen;
-        let (hazard_state, hazard_pos, hazard_warn) = match &self.run.mop {
-            Some(m) if m.is_active() => (2.0, m.pos, 1.0),
-            Some(m) if m.warning() > 0.0 => (1.0, m.pos, m.warning()),
-            _ => (0.0, glam::Vec2::ZERO, 0.0),
-        };
         OverlayUniform {
             queen_pos: q.pos.to_array(),
             queen_heading: q.heading.to_array(),
@@ -137,10 +136,10 @@ impl Session {
                 QueenState::LastStand { .. } => 1.0,
                 QueenState::Dead => 2.0,
             },
-            hazard_pos: hazard_pos.to_array(),
-            hazard_radius: crate::hazard::MOP_RADIUS,
-            hazard_state,
-            hazard_warn,
+            hazard_pos: [0.0; 2],
+            hazard_radius: 0.0,
+            hazard_state: 0.0,
+            hazard_warn: 0.0,
             guard_radius: self.swarm.tuning.guard_radius,
             _pad: [0.0; 2],
         }
@@ -156,6 +155,7 @@ impl Session {
             overlay: self.overlay(),
             glyphs: &text.glyphs,
             viewport: [width, height],
+            threats: self.last_threats,
         };
         self.renderer.draw(gpu, target, &frame);
     }

@@ -13,12 +13,14 @@ pub const CRITTERS_PER_CELL: f64 = 1.0;
 /// Hatchlings placed per simulation step at most (a steady trickle).
 pub const MAX_HATCH_PER_STEP: u32 = 16;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Colony {
     /// Food converted to mass but not yet hatched, in critters.
     pub bank: f64,
-    /// Living critters, as of the latest summary.
+    /// Living agents, as of the latest summary.
     pub alive: u32,
+    /// Critters each agent stands for (doubles at act transitions, §5).
+    pub critters_per_agent: u32,
     /// Critters lost so far (hazards, drowning).
     pub lost: u32,
     /// Critters spent on Forms so far.
@@ -32,6 +34,27 @@ pub struct Colony {
     confirmed_total: u32,
     sacrifice_requested: u64,
     sacrifice_confirmed: u32,
+    merged_seen: u32,
+}
+
+impl Default for Colony {
+    fn default() -> Self {
+        Self {
+            bank: 0.0,
+            alive: 0,
+            critters_per_agent: 1,
+            lost: 0,
+            spent: 0,
+            food_eaten: 0.0,
+            peak_mass: 0,
+            eaten_seen: 0,
+            requested_total: 0,
+            confirmed_total: 0,
+            sacrifice_requested: 0,
+            sacrifice_confirmed: 0,
+            merged_seen: 0,
+        }
+    }
 }
 
 impl Colony {
@@ -55,21 +78,31 @@ impl Colony {
             .saturating_sub(self.sacrifice_confirmed as u64) as u32
     }
 
+    /// Living critters (agents x critters per agent).
+    pub fn critters(&self) -> u32 {
+        self.alive * self.critters_per_agent
+    }
+
     /// Total mass: living critters, hatchlings on the way, and the bank, less
     /// critters already spent but still on the GPU.
     pub fn mass(&self) -> u32 {
-        (self.alive + self.in_flight() + self.bank.floor() as u32)
-            .saturating_sub(self.sacrifice_pending())
+        let agents = (self.alive + self.in_flight()) as i64 - self.sacrifice_pending() as i64;
+        let m = agents * self.critters_per_agent as i64 + self.bank.floor() as i64;
+        m.max(0) as u32
     }
 
-    /// Pays `cost` mass: from the bank first, then by giving up critters.
-    /// Returns how many critters must be sacrificed.
+    /// Pays `cost` mass: from the bank first, then by giving up agents.
+    /// Returns how many agents must be sacrificed.
     pub fn spend(&mut self, cost: u32) -> u32 {
-        let from_bank = (self.bank.floor() as u32).min(cost);
+        let from_bank = (self.bank.max(0.0).floor() as u32).min(cost);
         self.bank -= from_bank as f64;
         let rest = cost - from_bank;
-        self.sacrifice_requested += rest as u64;
-        rest
+        let cpa = self.critters_per_agent;
+        let agents = rest.div_ceil(cpa);
+        // Any overpay from rounding up to whole agents goes back in the bank.
+        self.bank += (agents * cpa - rest) as f64;
+        self.sacrifice_requested += agents as u64;
+        agents
     }
 
     /// Folds in a summary from the GPU.
@@ -79,6 +112,16 @@ impl Colony {
         self.food_eaten += new_food;
         self.bank += new_food * CRITTERS_PER_CELL;
         self.alive = s.alive;
+        // A merge folded agents together: double critters per agent and keep
+        // the mass (cells with an odd count round up, in the player's favour;
+        // otherwise the bank tops up the difference).
+        let merged = s.merged_total.wrapping_sub(self.merged_seen);
+        if merged > 0 {
+            self.merged_seen = s.merged_total;
+            let before = (s.alive + merged) as f64 * self.critters_per_agent as f64;
+            self.critters_per_agent *= 2;
+            self.bank += (before - s.alive as f64 * self.critters_per_agent as f64).max(0.0);
+        }
         self.lost = s.died_total;
         self.spent = s.sacrificed_total;
         self.sacrifice_confirmed = s.sacrificed_total;
@@ -86,11 +129,13 @@ impl Colony {
         self.peak_mass = self.peak_mass.max(self.mass());
     }
 
-    /// Takes hatch requests out of the bank, never more than will fit.
+    /// Takes hatch requests (in agents) out of the bank, never more than will fit.
     pub fn take_hatch(&mut self, capacity: u32) -> u32 {
         let free = capacity.saturating_sub(self.alive + self.in_flight());
-        let n = (self.bank.floor() as u32).min(free).min(MAX_HATCH_PER_STEP);
-        self.bank -= n as f64;
+        let cpa = self.critters_per_agent as f64;
+        let affordable = (self.bank.max(0.0) / cpa).floor() as u32;
+        let n = affordable.min(free).min(MAX_HATCH_PER_STEP);
+        self.bank -= n as f64 * cpa;
         self.requested_total += n as u64;
         n
     }
@@ -148,6 +193,28 @@ mod tests {
             ..Default::default()
         });
         assert_eq!((c.mass(), c.spent, c.sacrifice_pending()), (93, 7, 0));
+    }
+
+    #[test]
+    fn merging_agents_keeps_mass() {
+        let mut c = Colony::new(0);
+        c.observe(&SwarmSummary {
+            alive: 1_001,
+            ..Default::default()
+        });
+        assert_eq!(c.mass(), 1_001);
+        // Half the agents (rounded down per cell) fold into their neighbours.
+        c.observe(&SwarmSummary {
+            alive: 501,
+            merged_total: 500,
+            ..Default::default()
+        });
+        assert_eq!(c.critters_per_agent, 2);
+        assert_eq!(c.critters(), 1_002);
+        assert_eq!(c.mass(), 1_002, "the merge never loses mass (rounds up)");
+        // Hatching now costs two critters of food per agent.
+        c.grant(9.0);
+        assert_eq!(c.take_hatch(10_000), 4, "a bank of 9 buys 4 agents");
     }
 
     #[test]

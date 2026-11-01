@@ -1,5 +1,5 @@
 //! Level files: an ASCII map of tiles, expanded into a material grid plus the
-//! spots gameplay needs (Queen start, hazard route, food clusters).
+//! spots gameplay needs (Queen start, a patrol route, food clusters).
 //!
 //! See `assets/levels/kitchen.txt` for the format.
 
@@ -16,7 +16,8 @@ pub const KITCHEN: &str = include_str!("../assets/levels/kitchen.txt");
 pub struct Level {
     pub material: MaterialLayout,
     pub queen_start: Vec2,
-    /// Patrol route for the prototype hazard (the mop), in order.
+    /// A patrol route across the level, in order (unused since Step 4's
+    /// threats replaced the mop; kept for future patrolling enemies).
     pub hazard_route: Vec<Vec2>,
     /// Centres of food clusters, for scripted play and AI.
     pub food_spots: Vec<Vec2>,

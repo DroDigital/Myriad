@@ -7,8 +7,8 @@ The game is built in major steps, with one pull request per step. Each step leav
 | 1 | Foundation and GPU swarm | **Done** |
 | 2 | Edible world, mass and the Queen | **Done** |
 | 3 | Forms, Build and pathfinding | **Done** |
-| 4 | Threats and the Kitchen act (minimum-fun prototype) | Next |
-| 5 | Build depth: castes, mutations, species, Codex | Planned |
+| 4 | Threats and the Kitchen act (minimum-fun prototype) | **Done** |
+| 5 | Build depth: castes, mutations, species, Codex | Next |
 | 6 | Presentation: the cosmetic million, macro look, audio | Planned |
 | 7 | Web demo (WebGPU) | Planned |
 
@@ -91,64 +91,81 @@ Deferred:
 - The Queen walks over water (the CPU doesn't know where bridges are).
 - Gamepad input is untested on real hardware.
 
-## Step 4: Threats and the Kitchen act (minimum-fun prototype)
+## Step 4: Threats and the Kitchen act (done)
 
-**Goal:** something fights back, and the kitchen is a complete run. This is the last step of the §10 minimum-fun prototype.
+- **Threats** (`src/threats.rs`) are CPU entities, each holding a GPU `Threat` slot (8 slots, passed in a uniform buffer):
+  - Its body takes contact damage, summed per slot in `counters[ENEMY_HITS..]`.
+  - Its zone (circle, cone or lane) slows and kills critters with a per-step chance, higher where they're packed, so **Spread is a defence**.
+  - Every attack is telegraphed first on the overlay.
+  - **Spray bottle**: a cone of mist. **Wiping cloth**: sweeps a lane across the swarm.
+  - The Ring crushes enemies (3x contact damage) and the Spear 2x. A Comet knocks enemies back and interrupts them.
+- **Response level**: rises with mass (one level per doubling above 100) and with time survived.
+  - It paces spawns (up to 3 alive).
+  - It counters habits: heavy Shield use brings sprays in pairs, heavy Spear use brings cloths.
+  - A narrator line marks each new level.
+- **The Cleaner** arrives at 800 mass or with half the kitchen eaten.
+  - It has 2,000 hp and three phases: spray, then spray alternating with wipe, then a faster double spray.
+  - It **enrages** over time (faster, and harder on the Queen), so ignoring it loses.
+- **Run lifecycle**: title screen (Enter), playing, transition, won and lost screens, each with a summary (time, peak mass, % eaten).
+  - Beating the Cleaner starts the **act transition**: the camera pulls back, and a GPU `merge` pass folds every other agent per cell into its neighbour while critters per agent double. Mass is kept (rounded in the player's favour).
+- **The Queen** regenerates 3 hp/s after 4 s unhurt. The mop is gone.
+- **Headless**:
+  - `--threats`, `--boss-now`, `--passive` and `--bench` (32,768 critters for 600 steps).
+  - The scripted player fights: it steers onto nearby enemies, raises the Shield when an attack is aimed at the Queen, and spears the boss.
+  - In a boss rush with 1,500 critters, the fighting script wins (about 11 s) and the passive one loses (about 130 s).
+  - A full act from 10 critters reached the Cleaner at about 140 s and won at about 165 s.
+- `docs/playtest.md` is the §10 checklist for human playtests.
+
+Deferred, or for playtesting to settle:
+- **Balance.** The act is short (about 3 minutes against the design's 5), and the Cleaner falls fast to Spear and Ring. Tune with real players using the knobs listed in `playtest.md`.
+- The Comet's knockback and the Bloom have no dedicated tests.
+- The narrator is HUD text only, with no voice.
+- Act 2 (the Garden) is just a banner.
+- Enemies ignore walls while moving (they clamp to the world bounds).
+
+## Step 5: Build depth
+
+**Goal:** runs differ. What you hatch, the mutations you pick and the species you play change how the swarm fights and grows (§4.3, §4.5).
 
 Scope:
-1. **Enemy framework** (CPU entities, like the mop, rendered on the overlay layer):
-   - Each enemy has health, which critters wear down by contact. Report this as a per-enemy damage sum from the GPU: add an `enemy` buffer the steer pass atomically adds bites to, merged into an existing binding (the steer pass is at the 8-storage-buffer limit).
-   - Telegraphs go on the high-contrast overlay layer. Replace the mop with real threats:
-     - a **spray bottle** that telegraphs a cone, then mists it (kills critters, slows the rest);
-     - a **wiping cloth** that sweeps a lane.
-   - Ring now crushes enemies, and Comet knocks them back.
-2. **Response level** (§4.3): a rising pressure tied to mass and time.
-   - It spawns more and tougher threats.
-   - It counters the player's dominant style (e.g. lots of Shield use brings sprays that come from two sides).
-   - The narrator-style HUD line announces each change ("The kitchen has noticed you.").
-3. **The Cleaner** boss closes the act. It combines spray and wipe, and Shield and Spread are its counters. It has multiple phases and a health bar.
-4. **Run lifecycle**:
-   - title / start, win (Cleaner defeated) and lose (Queen falls) screens, with a summary (time, peak mass, % eaten) and restart;
-   - an **Act 1 → Act 2 transition** stub: the camera pulls back and critters per agent double (merge pairs of agents in a GPU pass, keeping mass); show "THE GARDEN" and end the prototype there.
-5. **Prototype exit check (§10)**: write `docs/playtest.md` with a checklist for human testers:
-   - steering feel;
-   - 3+ voluntary runs;
-   - the five-second clip test;
-   - Queen deaths that feel fair;
-   - performance on Steam Deck-class hardware.
-   Add a `--bench` headless preset that reports ms/step at 32k agents.
+1. **Castes** (§4.3): Workers, Soldiers, Spitters, Fliers, Nurses.
+   - Use `Agent.caste`, which is already reserved. The Queen's **laying ratio** sets the mix of hatchlings (hatch passes pick a caste by ratio from a hash).
+   - Per-caste multipliers live in a uniform table generated from Rust, as the kind table is: speed, eat rate, contact damage, hazard resistance, plus Nurse hatch-cost discounts.
+   - Render each caste in its own colour; keep the colours fixed and colour-blind safe.
+2. **Bloom meter and mutation cards**: eating fills a meter; each fill pauses the game and offers 3 cards.
+   - Mutations live in a data file (RON or a simple text format) of about 20 to start, each modifying a caste, a Form, the Queen or the laying ratio, plus 3 **evolutions** that combine two owned mutations (e.g. Acid Mandibles + Spore Bloom → Corrosive Bloom).
+   - Show cards with the bitmap font; keys 1–3 or the D-pad pick.
+3. **Species**: four parameter sets (Ants, Locusts, Slime cells, Fireflies) chosen on the title screen. Each changes `SwarmTuning` and gives one signature trait: Ants make cheaper bridges, Locusts eat faster in short hops, Slime cells merge to toughen, Fireflies' Bloom detonates.
+4. **Evolution Codex**: a meta-save (a JSON file in the platform data directory via `dirs`) unlocking species, Forms and mutations by milestones. It gives breadth, not power.
+5. Tests: caste ratios hold in hatching (GPU), mutation effects apply, cards are offered deterministically from a seed, and the save round-trips.
 
 Exit criteria:
-- A scripted headless run can beat the Cleaner with Forms, and a passive run loses.
-- Tests: enemy health is reduced by contact; the agent merge preserves mass; Response escalates with mass; the win and lose states.
-- Screenshots of the spray telegraph, the Cleaner fight and the win screen.
+- Two headless runs with different seeds and choices end measurably differently: caste mix, time to the Cleaner, and mass curve.
+- Tests pass.
+- Screenshots of the card pick, a caste-mixed swarm, and each species.
 
 ### Prompt to continue in a new session
 
 ```text
 You are continuing development of Myriad, a Rust + wgpu game in this repository.
 Read docs/ROADMAP.md first (conventions, including the 8-storage-buffer limit
-on the steer pass; what Steps 1-3 built; and the scope and exit criteria for
-"Step 4: Threats and the Kitchen act"), then docs/design/myriad-synthesis.md
-§4.3, §4.4 and §10. Then skim src/sim/passes.wgsl, src/sim/mod.rs, src/run.rs,
-src/forms.rs, src/hazard.rs and src/session.rs: the GPU owns the population and
-the material, the CPU sends a SimFrame and reads cumulative counters back
+on the steer pass, and what Steps 1-4 built), then the scope and exit criteria
+for "Step 5: Build depth", then docs/design/myriad-synthesis.md §4.3 and §4.5.
+Then skim src/sim/passes.wgsl, src/sim/mod.rs, src/run.rs, src/threats.rs,
+src/forms.rs and src/hud.rs: the GPU owns the population and the material,
+the CPU sends a SimFrame (including threats) and reads cumulative counters back
 asynchronously, and the gameplay rules in Run are pure CPU code.
 
-Implement Step 4 as scoped, in small tested increments: the enemy framework
-first, then Response, then the Cleaner, then the run lifecycle. Use Mesa
-lavapipe if there is no GPU (apt-get install -y mesa-vulkan-drivers
-libudev-dev). Run cargo fmt, cargo clippy --all-targets -- -D warnings and
+Implement Step 5 as scoped, in small tested increments: castes first, then
+mutations and the Bloom meter, then species, then the Codex. Use Mesa lavapipe
+if there is no GPU (apt-get install -y mesa-vulkan-drivers libudev-dev). Run
+cargo fmt, cargo clippy --all-targets -- -D warnings and
 MYRIAD_REQUIRE_GPU=1 cargo test. Check headless runs and look at screenshots
-before finishing; save them to docs/media/step4-*.png. Update docs/ROADMAP.md:
-mark Step 4 done, note anything deferred, and write the Step 5 continuation
+before finishing; save them to docs/media/step5-*.png. Update docs/ROADMAP.md:
+mark Step 5 done, note anything deferred, and write the Step 6 continuation
 prompt in the same style. Commit, push to your working branch, and open a PR
-titled "Step 4: Threats and the Kitchen act".
+titled "Step 5: Build depth".
 ```
-
-## Step 5: Build depth
-
-Castes and the Queen's laying ratio. A Bloom meter with mutation cards, defined in data files (start with about 20, plus 3 evolutions). Four species parameter sets (Ants, Locusts, Slime cells, Fireflies). An Evolution Codex meta-save.
 
 ## Step 6: Presentation
 

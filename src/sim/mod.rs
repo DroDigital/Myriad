@@ -32,6 +32,48 @@ pub const WORKGROUP_SIZE: u32 = 256;
 pub const AGENT_ALIVE: u32 = 1;
 /// Holding up a bridge over water (only while Build is held).
 pub const AGENT_ANCHORED: u32 = 2;
+/// Threat slots the GPU knows about (enemies and boss danger zones).
+pub const MAX_THREATS: usize = 8;
+/// Contact-damage counter units per hit point.
+pub const HIT_SCALE: f32 = 1000.0;
+
+/// One enemy as the GPU sees it. Layout must match `Threat` in `common.wgsl`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
+pub struct Threat {
+    pub pos: [f32; 2],
+    /// Unit direction the zone points.
+    pub dir: [f32; 2],
+    /// 0 = no body (a boss's extra zone).
+    pub body_radius: f32,
+    /// See [`zone`].
+    pub zone_kind: u32,
+    pub zone_len: f32,
+    /// Circle: radius. Cone: half-angle (radians). Lane: half-width.
+    pub zone_width: f32,
+    /// Chance per step that a critter in the active zone dies.
+    pub lethality: f32,
+    /// Velocity multiplier in the active zone.
+    pub slow: f32,
+    /// 0 off, 1 telegraphing (harmless), 2 active.
+    pub zone_on: u32,
+    /// Appearance, for the renderer (see `crate::threats::look`).
+    pub look: u32,
+    /// 0..1, for the renderer.
+    pub health: f32,
+    /// Telegraph progress 0..1, for the renderer.
+    pub telegraph: f32,
+    pub _pad: [f32; 2],
+}
+
+/// Zone shapes for [`Threat::zone_kind`].
+pub mod zone {
+    pub const NONE: u32 = 0;
+    pub const CIRCLE: u32 = 1;
+    pub const CONE: u32 = 2;
+    pub const LANE: u32 = 3;
+}
+
 /// Flow-field relaxation sweeps per step. The field's wavefront moves this
 /// many cells per step, so it crosses the kitchen in well under a second.
 pub const FLOW_SWEEPS: u32 = 6;
@@ -48,7 +90,10 @@ pub mod counter {
     pub const TICKETS: usize = 4;
     pub const SACRIFICED: usize = 5;
     pub const SAC_TICKETS: usize = 6;
-    pub const COUNT: usize = 8;
+    pub const MERGED: usize = 7;
+    /// First of [`super::MAX_THREATS`] per-threat contact-damage counters.
+    pub const ENEMY_HITS: usize = 8;
+    pub const COUNT: usize = 16;
 }
 
 const COMMON_WGSL: &str = include_str!("common.wgsl");
@@ -143,7 +188,8 @@ pub struct SimParams {
     pub build_active: u32,
     pub sacrifice: u32,
     pub drown_rate: f32,
-    pub _pad: [f32; 2],
+    pub merge: u32,
+    pub base_rest_density: f32,
 }
 
 /// Feel knobs for the swarm. Tweaked by Gather/Spread each step.
@@ -260,6 +306,9 @@ pub struct SimFrame {
     pub build: bool,
     /// Critters to give up this step (mass spent beyond the bank).
     pub sacrifice: u32,
+    pub threats: [Threat; MAX_THREATS],
+    /// Fold every other agent into its neighbour this step.
+    pub merge: bool,
 }
 
 impl SimFrame {
@@ -277,6 +326,8 @@ impl SimFrame {
             form: None,
             build: false,
             sacrifice: 0,
+            threats: [Threat::default(); MAX_THREATS],
+            merge: false,
         }
     }
 }
@@ -307,6 +358,7 @@ struct Pass {
 struct Passes {
     hatch_revive: Pass,
     hatch_append: Pass,
+    merge: Pass,
     water_reset: Pass,
     count: Pass,
     scan: Pass,
@@ -327,6 +379,7 @@ pub struct Swarm {
     alive_hint: u32,
     pub tuning: SwarmTuning,
     params: wgpu::Buffer,
+    threats: wgpu::Buffer,
     agents: wgpu::Buffer,
     agents_next: wgpu::Buffer,
     /// Per-cell counts, then per-cell start offsets.
@@ -375,6 +428,12 @@ impl Swarm {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let threats = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("threats"),
+            size: (MAX_THREATS * size_of::<Threat>()) as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let agents = storage("agents", agent_bytes);
         let agents_next = storage("agents next", agent_bytes);
         let grid = storage("cell counts and starts", cell_count as u64 * 8);
@@ -395,6 +454,7 @@ impl Swarm {
         let passes = Passes {
             hatch_revive: mp("hatch_revive", &[&params, &agents, &counters]),
             hatch_append: mp("hatch_append", &[&params, &agents, &counters]),
+            merge: mp("merge", &[&params, &agents, &agent_local, &counters]),
             water_reset: mp(
                 "water_reset",
                 &[&params, &material.amounts, &material.kinds],
@@ -439,6 +499,7 @@ impl Swarm {
                     &material.amounts,
                     &material.kinds,
                     &flow,
+                    &threats,
                 ],
             ),
             reduce: mp("reduce", &[&params, &agents, &partials, &counters]),
@@ -454,6 +515,7 @@ impl Swarm {
             alive_hint: 0,
             tuning: SwarmTuning::default(),
             params,
+            threats,
             agents,
             agents_next,
             grid,
@@ -581,7 +643,8 @@ impl Swarm {
             build_active: frame.build as u32,
             sacrifice: frame.sacrifice,
             drown_rate: t.drown_rate,
-            _pad: [0.0; 2],
+            merge: frame.merge as u32,
+            base_rest_density: t.rest_density,
         }
     }
 
@@ -591,12 +654,14 @@ impl Swarm {
         let params = self.params_for(frame);
         gpu.queue
             .write_buffer(&self.params, 0, bytemuck::bytes_of(&params));
+        gpu.queue
+            .write_buffer(&self.threats, 0, bytemuck::cast_slice(&frame.threats));
         let mut encoder = gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("swarm step"),
             });
-        self.encode_step(&mut encoder, frame.hatch);
+        self.encode_step(&mut encoder, frame.hatch, frame.merge);
         let slot =
             self.feedback
                 .record_copy(&mut encoder, &self.counters, &self.partials, self.steps);
@@ -621,7 +686,7 @@ impl Swarm {
         s
     }
 
-    fn encode_step(&self, encoder: &mut wgpu::CommandEncoder, hatch: u32) {
+    fn encode_step(&self, encoder: &mut wgpu::CommandEncoder, hatch: u32, merge: bool) {
         let groups = self.config.capacity.div_ceil(WORKGROUP_SIZE);
         // Per-step ticket counters (TICKETS and SAC_TICKETS) start at zero.
         let tickets = (counter::TICKETS * 4) as u64;
@@ -651,6 +716,9 @@ impl Swarm {
             run(&p.count, groups);
             run(&p.scan, 1);
             run(&p.scatter, groups);
+            if merge {
+                run(&p.merge, groups);
+            }
             for _ in 0..FLOW_SWEEPS {
                 run(&p.flow, cell_groups);
             }
@@ -786,6 +854,7 @@ mod tests {
     fn gpu_struct_layouts_match_wgsl() {
         assert_eq!(size_of::<Agent>(), 32);
         assert_eq!(size_of::<SimParams>(), 224);
+        assert_eq!(size_of::<Threat>(), 64);
     }
 
     #[test]
@@ -793,6 +862,7 @@ mod tests {
         for name in [
             "hatch_revive",
             "hatch_append",
+            "merge",
             "water_reset",
             "count",
             "scan",
@@ -815,6 +885,8 @@ mod tests {
             ("TICKETS", counter::TICKETS),
             ("SACRIFICED", counter::SACRIFICED),
             ("SAC_TICKETS", counter::SAC_TICKETS),
+            ("MERGED", counter::MERGED),
+            ("ENEMY_HITS", counter::ENEMY_HITS),
         ] {
             let decl = format!("const {name}: u32 = {index}u;");
             assert!(COMMON_WGSL.contains(&decl), "missing `{decl}`");

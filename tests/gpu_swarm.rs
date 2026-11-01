@@ -7,14 +7,15 @@ use myriad::forms::FormKind;
 use myriad::game::Controls;
 use myriad::gpu::Gpu;
 use myriad::headless::{self, CAPTURE_FORMAT, HeadlessOptions};
-use myriad::run::RunConfig;
+use myriad::run::{RunConfig, RunState};
 use myriad::session::{Session, SessionConfig};
 use myriad::sim::material::{FLAG_BLOCKED, FULL, KINDS, Kind, MaterialGrid, MaterialLayout};
 use myriad::sim::stats::SwarmStats;
 use myriad::sim::{
-    AGENT_ANCHORED, Agent, FLOW_INF, FormShape, HazardZone, INVALID_CELL, SimFrame, Swarm,
-    SwarmConfig, WorldBounds, counter, spawn_disk,
+    AGENT_ANCHORED, Agent, FLOW_INF, FormShape, HIT_SCALE, HazardZone, INVALID_CELL, MAX_THREATS,
+    SimFrame, Swarm, SwarmConfig, Threat, WorldBounds, counter, spawn_disk, zone,
 };
+use myriad::threats::{Enemy, EnemyKind, Phase};
 use myriad::util::SplitMix64;
 
 fn gpu() -> Option<Gpu> {
@@ -368,12 +369,14 @@ fn hazards_kill_and_dead_slots_are_reused() {
     assert_eq!(alive(&swarm, &gpu).len(), 200);
 }
 
-fn session(gpu: &Gpu, hazard: Option<f32>) -> Session {
+fn session(gpu: &Gpu, threats: bool) -> Session {
     let cfg = SessionConfig {
         run: RunConfig {
             initial_critters: 60,
             capacity: 4_096,
-            hazard_delay: hazard,
+            threats,
+            boss_mass: u32::MAX,
+            ..Default::default()
         },
         seed: 1,
     };
@@ -393,7 +396,7 @@ fn settle(gpu: &Gpu, s: &mut Session) {
 #[test]
 fn session_hatches_banked_mass_and_renders_the_hud() {
     let Some(gpu) = gpu() else { return };
-    let mut s = session(&gpu, None);
+    let mut s = session(&gpu, false);
     s.grant(40.0);
     for _ in 0..120 {
         s.step(&gpu, &Controls::default());
@@ -411,15 +414,20 @@ fn session_hatches_banked_mass_and_renders_the_hud() {
 }
 
 #[test]
-fn the_mop_kills_critters_and_can_end_the_run() {
+fn a_spray_on_the_queen_kills_critters_and_can_end_the_run() {
     let Some(gpu) = gpu() else { return };
-    let mut s = session(&gpu, Some(0.0));
-    // Drag the mop onto the Queen and keep it there.
+    let mut s = session(&gpu, true);
+    // Keep a spray parked next to the Queen, attacking her.
+    let spray = Enemy::new(EnemyKind::Spray, s.run.queen.pos, 1.0);
+    assert!(s.run.spawn(spray));
     let mut lost = false;
-    for _ in 0..1_200 {
+    for _ in 0..3_600 {
         let q = s.run.queen.pos;
-        if let Some(m) = s.run.mop.as_mut() {
-            m.pos = q;
+        for e in &mut s.run.enemies {
+            e.pos = q + Vec2::new(-4.0, 0.0);
+            e.aim = Vec2::X;
+            e.phase = Phase::Attack(0.0);
+            e.health = e.max_health;
         }
         s.step(&gpu, &Controls::default());
         if s.run.is_over() {
@@ -428,8 +436,8 @@ fn the_mop_kills_critters_and_can_end_the_run() {
         }
     }
     settle(&gpu, &mut s);
-    assert!(lost, "the Queen survived a mop on her head for 20 s");
-    assert!(s.run.colony.lost > 0, "the mop killed no critters");
+    assert!(lost, "the Queen survived a minute of spray in the face");
+    assert!(s.run.colony.lost > 0, "the spray killed no critters");
 }
 
 #[test]
@@ -627,4 +635,131 @@ fn spending_mass_sacrifices_exactly_that_many() {
     assert_eq!(counters[counter::SACRIFICED], 40);
     assert_eq!(counters[counter::DIED], 0, "spent critters are not 'lost'");
     assert_eq!(alive(&swarm, &gpu).len(), 260);
+}
+
+#[test]
+fn critters_bite_enemies_and_the_ring_crushes_harder() {
+    let Some(gpu) = gpu() else { return };
+    let hits = |ring: bool| {
+        let mut rng = SplitMix64::new(31);
+        let agents = spawn_disk(Vec2::ZERO, 600, 0.5, &mut rng);
+        let mut swarm = swarm_with(&gpu, &agents, 1_024);
+        let mut threats = [Threat::default(); MAX_THREATS];
+        threats[2] = Threat {
+            pos: [6.0, 0.0],
+            dir: [1.0, 0.0],
+            body_radius: 2.0,
+            slow: 1.0,
+            ..Default::default()
+        };
+        for step in 0..300 {
+            let mut f = frame(Vec2::new(6.0, 0.0), step);
+            f.threats = threats;
+            // The Ring closes in around the enemy over its duration.
+            f.form = ring.then_some(FormShape {
+                kind: FormKind::Ring as u32,
+                origin: Vec2::new(6.0, 0.0),
+                dir: Vec2::X,
+                size: 9.0,
+                t: (step % 180) as f32 / 180.0,
+            });
+            swarm.step(&gpu, &f);
+        }
+        let c = swarm.read_counters(&gpu).unwrap();
+        for (k, &h) in c[counter::ENEMY_HITS..counter::ENEMY_HITS + MAX_THREATS]
+            .iter()
+            .enumerate()
+        {
+            if k != 2 {
+                assert_eq!(h, 0, "only slot 2 has a body");
+            }
+        }
+        c[counter::ENEMY_HITS + 2] as f32 / HIT_SCALE
+    };
+    let plain = hits(false);
+    let ring = hits(true);
+    eprintln!("plain {plain:.0} hp, ring {ring:.0} hp");
+    assert!(plain > 50.0, "the swarm barely touched it: {plain}");
+    assert!(ring > plain * 1.5, "plain {plain:.0}, ring {ring:.0}");
+}
+
+#[test]
+fn spray_zones_kill_crowds_faster_than_spread_critters() {
+    let Some(gpu) = gpu() else { return };
+    let deaths = |gather: f32| {
+        let mut rng = SplitMix64::new(32);
+        let agents = spawn_disk(Vec2::ZERO, 800, 0.5, &mut rng);
+        let mut swarm = swarm_with(&gpu, &agents, 1_024);
+        for step in 0..240 {
+            let mut f = frame(Vec2::ZERO, step);
+            f.gather = gather;
+            if step >= 120 {
+                f.threats[0] = Threat {
+                    pos: [-30.0, 0.0],
+                    dir: [1.0, 0.0],
+                    zone_kind: zone::CONE,
+                    zone_len: 60.0,
+                    zone_width: 0.6,
+                    lethality: 0.02,
+                    slow: 0.9,
+                    zone_on: 2,
+                    ..Default::default()
+                };
+            }
+            swarm.step(&gpu, &f);
+        }
+        swarm.read_counters(&gpu).unwrap()[counter::DIED]
+    };
+    let gathered = deaths(1.0);
+    let spread = deaths(-1.0);
+    eprintln!("gathered {gathered}, spread {spread}");
+    assert!(spread > 0 && gathered as f32 > spread as f32 * 1.3);
+}
+
+#[test]
+fn merge_halves_the_agents() {
+    let Some(gpu) = gpu() else { return };
+    let mut rng = SplitMix64::new(33);
+    let agents = spawn_disk(Vec2::ZERO, 1_000, 0.5, &mut rng);
+    let mut swarm = swarm_with(&gpu, &agents, 1_024);
+    let mut f = frame(Vec2::ZERO, 0);
+    f.merge = true;
+    swarm.step(&gpu, &f);
+    let merged = swarm.read_counters(&gpu).unwrap()[counter::MERGED];
+    let alive = alive(&swarm, &gpu).len() as u32;
+    assert_eq!(alive + merged, 1_000);
+    // Every other agent per cell folds: survivors are half, rounded up per cell.
+    assert!((500..600).contains(&alive), "{alive} survivors");
+    swarm.step(&gpu, &frame(Vec2::ZERO, 1));
+    assert_eq!(
+        swarm.read_counters(&gpu).unwrap()[counter::MERGED],
+        merged,
+        "only on request"
+    );
+}
+
+fn boss_rush(passive: bool) -> headless::HeadlessReport {
+    headless::run(&HeadlessOptions {
+        agents: 1_500,
+        // Up to 5 minutes: the Cleaner enrages until a passive Queen falls.
+        frames: 18_000,
+        threats: true,
+        boss_now: true,
+        passive,
+        ..Default::default()
+    })
+    .unwrap()
+}
+
+#[test]
+fn a_fighting_swarm_beats_the_cleaner_and_a_passive_one_loses() {
+    if gpu().is_none() {
+        return;
+    }
+    let fighting = boss_rush(false);
+    eprintln!("fighting: {fighting}");
+    assert_eq!(fighting.outcome, RunState::Won, "{fighting}");
+    let passive = boss_rush(true);
+    eprintln!("passive: {passive}");
+    assert_eq!(passive.outcome, RunState::Lost, "{passive}");
 }

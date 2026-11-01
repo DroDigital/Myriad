@@ -8,6 +8,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use glam::Vec2;
 
+use crate::forms::FormKind;
 use crate::game::Controls;
 use crate::gpu::Gpu;
 use crate::level;
@@ -23,8 +24,14 @@ pub struct HeadlessOptions {
     pub width: u32,
     pub height: u32,
     pub seed: u64,
-    /// Include the mop hazard (off by default so scripted runs are stable).
-    pub hazard: bool,
+    /// Spawn threats and the Cleaner (off by default so food runs are stable).
+    pub threats: bool,
+    /// The scripted player never fights (no attacks, no Forms).
+    pub passive: bool,
+    /// Bring the Cleaner at once.
+    pub boss_now: bool,
+    /// Multiplies the Cleaner's health.
+    pub boss_health: f32,
     pub screenshot: Option<PathBuf>,
 }
 
@@ -37,7 +44,10 @@ impl Default for HeadlessOptions {
             width: 1280,
             height: 720,
             seed: 1,
-            hazard: false,
+            threats: false,
+            passive: false,
+            boss_now: false,
+            boss_health: 1.0,
             screenshot: None,
         }
     }
@@ -46,13 +56,17 @@ impl Default for HeadlessOptions {
 #[derive(Debug)]
 pub struct HeadlessReport {
     pub adapter: String,
+    /// Steps actually run (a run that ends early stops).
     pub frames: u32,
+    /// In-game seconds played.
+    pub seconds: f32,
     pub ms_per_step: f64,
     pub stats: SwarmStats,
     pub mass: u32,
     pub peak_mass: u32,
     pub eaten_fraction: f64,
     pub queen_alive: bool,
+    pub outcome: RunState,
     /// Share of living critters in the main body (stragglers drag it down).
     pub body_share: f64,
     pub screenshot: Option<PathBuf>,
@@ -64,11 +78,16 @@ impl fmt::Display for HeadlessReport {
         writeln!(f, "{} steps: {:.3} ms/step", self.frames, self.ms_per_step)?;
         writeln!(
             f,
-            "run: mass {} (peak {}) | {:.1}% of the kitchen eaten | queen {} | {:.1}% in the main body",
+            "run: {:.0}s | mass {} (peak {}) | {:.1}% of the kitchen eaten | queen {} | {:.1}% in the main body",
+            self.seconds,
             self.mass,
             self.peak_mass,
             self.eaten_fraction * 100.0,
-            if self.queen_alive { "alive" } else { "fallen" },
+            match (self.outcome, self.queen_alive) {
+                (RunState::Won, _) => "won the act",
+                (_, true) => "alive",
+                _ => "fallen",
+            },
             self.body_share * 100.0
         )?;
         write!(f, "swarm: {}", self.stats)?;
@@ -91,6 +110,8 @@ pub struct Script {
     /// Food eaten when the last progress check happened, and when that was.
     last_food: f64,
     since_progress: f32,
+    /// Never fight: no attacks, no Forms.
+    pub passive: bool,
 }
 
 impl Script {
@@ -107,7 +128,44 @@ impl Script {
             travel: 0.0,
             last_food: 0.0,
             since_progress: 0.0,
+            passive: false,
         }
+    }
+
+    /// A fighting player: attack the Cleaner (or the nearest enemy), raise
+    /// the Shield when an attack is aimed at the Queen, and spear the boss.
+    fn fight(&self, run: &Run) -> Option<Controls> {
+        if self.passive {
+            return None;
+        }
+        let queen = run.queen.pos;
+        let target = run.boss().or_else(|| {
+            run.enemies
+                .iter()
+                .filter(|e| e.pos.distance(queen) < 30.0)
+                .min_by(|a, b| a.pos.distance(queen).total_cmp(&b.pos.distance(queen)))
+        })?;
+        let threatened = run
+            .enemies
+            .iter()
+            .any(|e| e.zones().into_iter().flatten().any(|z| z.contains(queen)));
+        let center = run.game.swarm_center.unwrap_or(queen);
+        let mut c = Controls {
+            pointer: Some(target.pos),
+            aim: Some(target.pos),
+            ..Default::default()
+        };
+        let slot_of = |k: FormKind| run.forms.slots.iter().position(|&s| s == k);
+        if threatened {
+            if let Some(s) = slot_of(FormKind::Shield) {
+                c.form[s] = true;
+            }
+        } else if center.distance(target.pos) < 25.0
+            && let Some(s) = slot_of(FormKind::Spear)
+        {
+            c.form[s] = true;
+        }
+        Some(c)
     }
 
     pub fn target(&self) -> Option<Vec2> {
@@ -115,6 +173,9 @@ impl Script {
     }
 
     pub fn controls(&mut self, run: &Run, dt: f32) -> Controls {
+        if let Some(c) = self.fight(run) {
+            return c;
+        }
         let Some(target) = self.target() else {
             return Controls::default();
         };
@@ -174,17 +235,30 @@ pub fn run(opts: &HeadlessOptions) -> Result<HeadlessReport> {
         run: RunConfig {
             initial_critters: opts.agents,
             capacity: opts.capacity.max(opts.agents),
-            hazard_delay: opts.hazard.then_some(20.0),
+            threats: opts.threats,
+            boss_mass: if opts.boss_now {
+                0
+            } else {
+                RunConfig::default().boss_mass
+            },
+            boss_health: opts.boss_health,
+            ..Default::default()
         },
         seed: opts.seed,
     };
     let aspect = opts.width as f32 / opts.height.max(1) as f32;
     let mut session = Session::new(&gpu, CAPTURE_FORMAT, aspect, &cfg);
     let mut script = Script::new(session.level.queen_start, &session.level.food_spots);
+    script.passive = opts.passive;
 
     gpu.wait_idle();
     let start = Instant::now();
+    let mut steps = 0u32;
     for _ in 0..opts.frames {
+        if session.run.is_over() {
+            break;
+        }
+        steps += 1;
         let controls = script.controls(&session.run, SIM_DT);
         session.step(&gpu, &controls);
         if session.swarm.steps().is_multiple_of(300) {
@@ -231,9 +305,10 @@ pub fn run(opts: &HeadlessOptions) -> Result<HeadlessReport> {
     let run = &session.run;
     Ok(HeadlessReport {
         adapter: gpu.adapter_summary(),
-        frames: opts.frames,
-        ms_per_step: if opts.frames > 0 {
-            elapsed * 1000.0 / opts.frames as f64
+        frames: steps,
+        seconds: run.elapsed,
+        ms_per_step: if steps > 0 {
+            elapsed * 1000.0 / steps as f64
         } else {
             0.0
         },
@@ -241,7 +316,8 @@ pub fn run(opts: &HeadlessOptions) -> Result<HeadlessReport> {
         mass: run.colony.mass(),
         peak_mass: run.colony.peak_mass,
         eaten_fraction: run.eaten_fraction(),
-        queen_alive: run.state == RunState::Playing,
+        queen_alive: !run.queen.is_dead(),
+        outcome: run.state,
         body_share: body_share(&agents, run.game.focal, run.game.swarm_radius),
         screenshot,
     })

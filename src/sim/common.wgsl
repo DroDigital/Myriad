@@ -57,8 +57,63 @@ struct Params {
     sacrifice: u32,
     // Chance per step that a critter on open water drowns.
     drown_rate: f32,
-    pad2: f32,
-    pad3: f32,
+    // Non-zero on the step that merges pairs of agents (act transitions).
+    merge: u32,
+    // Unscaled rest density: how crowded counts as "crowded" for spray, so
+    // Gather (which packs tighter) is riskier under fire than Spread.
+    base_rest_density: f32,
+}
+
+// One enemy (or one extra danger zone of a boss). Must match `Threat` in
+// src/sim/mod.rs. `body_radius` 0 = no body; `zone_kind` 0 = no zone.
+struct Threat {
+    pos: vec2f,
+    dir: vec2f,
+    body_radius: f32,
+    zone_kind: u32,
+    zone_len: f32,
+    // Circle: radius. Cone: half-angle (radians). Lane: half-width.
+    zone_width: f32,
+    // Chance per step that a critter in the zone dies.
+    lethality: f32,
+    // Velocity multiplier in the zone.
+    slow: f32,
+    // 0 off, 1 telegraphing (harmless), 2 active.
+    zone_on: u32,
+    look: u32,
+    health: f32,
+    telegraph: f32,
+    pad: vec2f,
+}
+
+struct Threats {
+    items: array<Threat, 8>,
+}
+
+const MAX_THREATS: u32 = 8u;
+const ZONE_CIRCLE: u32 = 1u;
+const ZONE_CONE: u32 = 2u;
+const ZONE_LANE: u32 = 3u;
+
+// Is `p` inside threat `t`'s zone?
+fn in_zone(t: Threat, p: vec2f) -> bool {
+    let d = p - t.pos;
+    switch t.zone_kind {
+        case ZONE_CIRCLE: {
+            return length(d) < t.zone_width;
+        }
+        case ZONE_CONE: {
+            let len = length(d);
+            return len < t.zone_len && len > 1e-3 && dot(d / len, t.dir) > cos(t.zone_width);
+        }
+        case ZONE_LANE: {
+            let h = clamp(dot(d, t.dir), 0.0, t.zone_len);
+            return length(d - t.dir * h) < t.zone_width;
+        }
+        default: {
+            return false;
+        }
+    }
 }
 
 struct Agent {
@@ -84,6 +139,8 @@ const DIED: u32 = 3u;          // cumulative critters killed
 const TICKETS: u32 = 4u;       // per step: dead slots that claimed a hatch ticket
 const SACRIFICED: u32 = 5u;    // cumulative critters spent on Forms
 const SAC_TICKETS: u32 = 6u;   // per step: critters that claimed a sacrifice ticket
+const MERGED: u32 = 7u;        // cumulative agents folded into a neighbour
+const ENEMY_HITS: u32 = 8u;    // 8 slots: cumulative contact damage per threat
 
 // Form kinds. Must match `FormKind` in src/forms.rs.
 const FORM_NONE: u32 = 0u;

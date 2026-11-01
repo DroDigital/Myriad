@@ -2,7 +2,7 @@
 // (the kind table + common.wgsl prepended) so every pass gets an exact
 // auto-derived layout. Order per step:
 //   [hatch_revive -> hatch_append] -> water_reset -> count -> scan -> scatter
-//   -> flow x N -> steer -> (copy) -> reduce
+//   -> [merge] -> flow x N -> steer -> (copy) -> reduce
 // The `grid` buffer holds per-cell counts in [0, cell_count) and cell start
 // offsets in [cell_count, 2 * cell_count).
 // Agent passes dispatch over the whole capacity and skip slots >= LIVE_END:
@@ -139,6 +139,25 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     sorted[grid[params.cell_count + c] + agent_local[i]] = i;
 }
 
+//! pass:merge
+// Act transitions: every other agent in each grid cell folds into its
+// neighbour, halving the agents while the CPU doubles critters per agent.
+@group(0) @binding(1) var<storage, read_write> agents: array<Agent>;
+@group(0) @binding(2) var<storage, read> agent_local: array<u32>;
+@group(0) @binding(3) var<storage, read_write> counters: array<atomic<u32>>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+    let i = gid.x;
+    if (params.merge == 0u || i >= atomicLoad(&counters[LIVE_END])) {
+        return;
+    }
+    if ((agents[i].flags & ALIVE) != 0u && (agent_local[i] & 1u) == 1u) {
+        agents[i].flags = 0u;
+        atomicAdd(&counters[MERGED], 1u);
+    }
+}
+
 //! pass:water_reset
 // Water cells store how many anchored critters hold them up this step; the
 // count pass rebuilds it, so clear it first.
@@ -258,9 +277,14 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 @group(0) @binding(6) var<storage, read_write> mat_amount: array<atomic<u32>>;
 @group(0) @binding(7) var<storage, read> mat_kind: array<u32>;
 @group(0) @binding(8) var<storage, read> flow: array<f32>;
+@group(0) @binding(9) var<uniform> threats: Threats;
 
 var<workgroup> wg_eaten: atomic<u32>;
 var<workgroup> wg_died: atomic<u32>;
+var<workgroup> wg_hits: array<atomic<u32>, 8>;
+
+// Contact damage per critter per step, in counter units (1000 = 1 hp).
+const HIT_PER_STEP: f32 = 1000.0 / 60.0;
 
 fn kind_flags(k: u32) -> u32 {
     var table = KIND_FLAGS;
@@ -366,12 +390,16 @@ fn form_pull(p: vec2f, seed: f32) -> vec3f {
             return vec3f((q - p) * 8.0, select(0.0, 1.0, abs(len - size) < band));
         }
         case FORM_RING: {
-            // A circle that closes in, crushing what is inside.
+            // A circle that closes in, crushing what is inside: critters
+            // outside are drawn to the ring; inside, they keep biting.
             let r = size * mix(1.0, 0.35, params.form_t);
             let d = p - o;
             let len = max(length(d), 1e-3);
-            let q = o + d / len * r;
-            return vec3f((q - p) * 8.0, select(0.0, 1.0, abs(len - r) < 1.5));
+            var pull = vec2f(0.0);
+            if (len > r) {
+                pull = (o + d / len * r - p) * 8.0;
+            }
+            return vec3f(pull, select(0.0, 1.0, len < r + 1.5));
         }
         case FORM_COMET: {
             // A tight ball rushing along the aim direction.
@@ -615,6 +643,30 @@ fn simulate(i: u32) -> vec2u {
         acc += (vel_sum * inv - a.vel) * params.align_strength;
         acc += (pos_sum * inv - a.pos) * params.cohesion_strength;
     }
+    // Enemies: critters near a body swarm onto it (and are kept out of it),
+    // biting it on contact. The Form multiplies the damage.
+    for (var t = 0u; t < MAX_THREATS; t++) {
+        let th = threats.items[t];
+        if (th.body_radius <= 0.0) {
+            continue;
+        }
+        let d = a.pos - th.pos;
+        let len = max(length(d), 1e-3);
+        if (len < th.body_radius) {
+            acc += d / len * (1.0 - len / th.body_radius) * 90.0;
+        } else if (len < th.body_radius + 4.0) {
+            acc -= d / len * 10.0;
+        }
+        if (len < th.body_radius + 0.6) {
+            var mult = 1.0;
+            if (in_form && params.form_kind == FORM_RING) {
+                mult = 3.0;
+            } else if (in_form && params.form_kind == FORM_SPEAR) {
+                mult = 2.0;
+            }
+            atomicAdd(&wg_hits[t], u32(HIT_PER_STEP * mult));
+        }
+    }
     // Forage: drift toward the richest food nearby, so the swarm flows over
     // whatever the player steers it onto instead of milling on bare floor.
     acc += forage(a.pos, a.seed) * params.forage_strength;
@@ -715,6 +767,20 @@ fn simulate(i: u32) -> vec2u {
         && distance(np, params.hazard_pos) < params.hazard_radius) {
         died = 1u;
     }
+    // Threat zones: slow, and kill with some chance per step. Crowded
+    // critters die more readily, so spreading out is a defence.
+    for (var t = 0u; t < MAX_THREATS; t++) {
+        let th = threats.items[t];
+        if (th.zone_on != 2u || !in_zone(th, np)) {
+            continue;
+        }
+        a.vel *= th.slow;
+        let packed = max(dens / (params.base_rest_density * 1.0471976 * nr * nr) - 1.0, 0.0);
+        let chance = th.lethality * clamp(0.4 + packed, 0.4, 1.5);
+        if (!shielded && hash_f(i * 2246822519u ^ hash_u32(params.step + t * 7919u)) < chance) {
+            died = 1u;
+        }
+    }
     if ((a.flags & ANCHORED) == 0u && is_open_water(mat_cell(np))
         && hash_f(i ^ hash_u32(params.step * 0x9e3779b9u)) < params.drown_rate) {
         died = 1u;
@@ -752,6 +818,12 @@ fn main(
         let d = atomicLoad(&wg_died);
         if (d > 0u) {
             atomicAdd(&counters[DIED], d);
+        }
+    }
+    if (t < MAX_THREATS) {
+        let h = atomicLoad(&wg_hits[t]);
+        if (h > 0u) {
+            atomicAdd(&counters[ENEMY_HITS + t], h);
         }
     }
 }

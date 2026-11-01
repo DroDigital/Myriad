@@ -63,7 +63,11 @@ pub fn build(run: &Run, w: f32, h: f32) -> TextBatch {
     b.text(
         margin,
         margin + 2.2 * line,
-        &format!("CRITTERS {}   LOST {}", run.colony.alive, run.colony.lost),
+        &format!(
+            "CRITTERS {}   LOST {}",
+            run.colony.critters(),
+            run.colony.lost
+        ),
         color::DIM,
         s,
     );
@@ -134,29 +138,78 @@ pub fn build(run: &Run, w: f32, h: f32) -> TextBatch {
         s,
     );
 
+    // Boss health, top centre.
+    if let Some(boss) = run.boss() {
+        b.centered(w * 0.5, margin, "THE CLEANER", color::RED, s);
+        let blocks = (boss.health_frac() * 20.0).ceil() as usize;
+        let bar: String = std::iter::repeat_n('\u{2588}', blocks).collect();
+        b.text(
+            w * 0.5 - TextBatch::width(&"#".repeat(20), s) * 0.5,
+            margin + line * 1.2,
+            &bar,
+            color::RED,
+            s,
+        );
+    }
+
+    // The narrator, bottom centre.
+    if let Some((text, _)) = run.narration {
+        b.centered(w * 0.5, h - margin - line * 2.5, text, color::AMBER, s);
+    }
+
     // Warnings and outcomes, centred.
     let blink = (run.game.time * 3.0).fract() < 0.6;
-    if let Some(mop) = &run.mop
-        && mop.warning() > 0.0
-        && blink
-    {
-        b.centered(w * 0.5, margin, "THE MOP IS COMING", color::AMBER, s);
-    }
     if matches!(q.state, QueenState::LastStand { .. }) && blink {
         b.centered(w * 0.5, h * 0.3, "THE QUEEN IS IN DANGER!", color::RED, big);
     }
-    if run.state == RunState::Lost {
-        b.centered(w * 0.5, h * 0.38, "THE QUEEN HAS FALLEN", color::RED, big);
-        b.centered(
-            w * 0.5,
-            h * 0.38 + 2.5 * line,
-            &format!(
-                "PEAK MASS {}  -  PRESS R TO TRY AGAIN",
-                run.colony.peak_mass
-            ),
-            color::WHITE,
-            s,
-        );
+    let summary = run.summary();
+    let stats = format!(
+        "{:.0}:{:02.0}  -  PEAK MASS {}  -  {:.0}% EATEN",
+        (summary.seconds / 60.0).floor(),
+        summary.seconds % 60.0,
+        summary.peak_mass,
+        summary.eaten_fraction * 100.0
+    );
+    match run.state {
+        RunState::Title => {
+            b.centered(w * 0.5, h * 0.3, "MYRIAD", color::WHITE, big * 2.0);
+            b.centered(
+                w * 0.5,
+                h * 0.3 + 5.0 * line,
+                "YOU ARE THE HORDE.",
+                color::AMBER,
+                s,
+            );
+            if blink {
+                b.centered(w * 0.5, h * 0.62, "PRESS ENTER TO HATCH", color::WHITE, big);
+            }
+        }
+        RunState::Transition { .. } => {
+            b.centered(w * 0.5, h * 0.3, "THE GARDEN", color::GREEN, big * 1.5);
+        }
+        RunState::Won => {
+            b.centered(w * 0.5, h * 0.3, "ACT 1 CLEARED", color::GREEN, big);
+            b.centered(w * 0.5, h * 0.3 + 2.5 * line, &stats, color::WHITE, s);
+            b.centered(
+                w * 0.5,
+                h * 0.3 + 4.0 * line,
+                "THE GARDEN AWAITS  -  PRESS R TO PLAY AGAIN",
+                color::DIM,
+                s,
+            );
+        }
+        RunState::Lost => {
+            b.centered(w * 0.5, h * 0.38, "THE QUEEN HAS FALLEN", color::RED, big);
+            b.centered(w * 0.5, h * 0.38 + 2.5 * line, &stats, color::WHITE, s);
+            b.centered(
+                w * 0.5,
+                h * 0.38 + 4.0 * line,
+                "PRESS R TO TRY AGAIN",
+                color::DIM,
+                s,
+            );
+        }
+        RunState::Playing => {}
     }
     b
 }
@@ -218,5 +271,6 @@ mod tests {
         let t = text_of(&build(&run, 1280.0, 720.0));
         assert!(t.contains("THEQUEENHASFALLEN"), "{t}");
         assert!(t.contains("PRESSRTOTRYAGAIN"));
+        assert!(t.contains("PEAKMASS"));
     }
 }

@@ -68,6 +68,48 @@ struct Agent {
 @group(0) @binding(5) var<uniform> hud: Hud;
 @group(0) @binding(6) var<storage, read> glyphs: array<Glyph>;
 @group(0) @binding(7) var<storage, read> font: array<u32>;
+@group(0) @binding(8) var<uniform> threats: Threats;
+
+// Must match `Threat` in src/sim/mod.rs (and common.wgsl).
+struct Threat {
+    pos: vec2f,
+    dir: vec2f,
+    body_radius: f32,
+    zone_kind: u32,
+    zone_len: f32,
+    zone_width: f32,
+    lethality: f32,
+    slow: f32,
+    zone_on: u32,
+    look: u32,
+    health: f32,
+    telegraph: f32,
+    pad: vec2f,
+}
+
+struct Threats {
+    items: array<Threat, 8>,
+}
+
+fn in_zone(t: Threat, p: vec2f) -> bool {
+    let d = p - t.pos;
+    switch t.zone_kind {
+        case 1u: {
+            return length(d) < t.zone_width;
+        }
+        case 2u: {
+            let len = length(d);
+            return len < t.zone_len && len > 1e-3 && dot(d / len, t.dir) > cos(t.zone_width);
+        }
+        case 3u: {
+            let h = clamp(dot(d, t.dir), 0.0, t.zone_len);
+            return length(d - t.dir * h) < t.zone_width;
+        }
+        default: {
+            return false;
+        }
+    }
+}
 
 fn to_linear(c: vec3f) -> vec3f {
     return pow(c, vec3f(2.2));
@@ -336,6 +378,74 @@ fn fs_overlay(in: GroundOut) -> @location(0) vec4f {
             let ring = 1.0 - smoothstep(0.0, 0.1 + px, abs(d - r));
             let pulse = 0.5 + 0.5 * sin(cam.time * 8.0);
             out = over(out, linear(vec3f(0.95, 0.55, 0.15)), ring * dash * (0.4 + 0.6 * pulse) * overlay.hazard_warn);
+        }
+    }
+
+    // Threats: zones first (telegraphs as pulsing outlines, attacks as mist
+    // or a wet wipe), then bodies with a health ring.
+    for (var k = 0u; k < 8u; k++) {
+        let t = threats.items[k];
+        if (t.zone_kind != 0u && t.zone_on != 0u) {
+            let inside = in_zone(t, w);
+            let e = px * 2.0;
+            let edge = inside != in_zone(t, w + vec2f(e, 0.0)) || inside != in_zone(t, w - vec2f(e, 0.0))
+                || inside != in_zone(t, w + vec2f(0.0, e)) || inside != in_zone(t, w - vec2f(0.0, e));
+            if (t.zone_on == 1u) {
+                let pulse = 0.55 + 0.45 * sin(cam.time * 10.0);
+                if (inside) {
+                    out = over(out, linear(vec3f(1.0, 0.55, 0.1)), 0.08 + 0.17 * t.telegraph);
+                }
+                if (edge) {
+                    out = over(out, linear(vec3f(1.0, 0.6, 0.1)), pulse);
+                }
+            } else if (inside) {
+                let n = 0.5 + 0.5 * sin(w.x * 1.9 + cam.time * 6.0) * sin(w.y * 2.3 - cam.time * 5.0);
+                var col = mix(vec3f(0.80, 0.92, 1.0), vec3f(1.0, 1.0, 1.0), n);
+                if (t.zone_kind == 1u) {
+                    col = mix(vec3f(0.35, 0.55, 0.85), vec3f(0.85, 0.9, 1.0), n);
+                }
+                out = over(out, linear(col), 0.45);
+            }
+        }
+        if (t.body_radius > 0.0) {
+            let d = w - t.pos;
+            let len = length(d);
+            let r = t.body_radius;
+            var body_col = vec3f(0.55, 0.85, 0.55);
+            if (t.look == 2u) {
+                // Cloth: a checked square.
+                let c = step(0.0, sin(w.x * 2.5) * sin(w.y * 2.5));
+                body_col = mix(vec3f(0.95, 0.8, 0.25), vec3f(0.3, 0.55, 0.9), c);
+            } else if (t.look == 3u) {
+                body_col = vec3f(0.85, 0.15, 0.15);
+            }
+            var sd = len - r;
+            if (t.look == 2u) {
+                let q = abs(d) - vec2f(r * 0.8);
+                sd = length(max(q, vec2f(0.0))) + min(max(q.x, q.y), 0.0) - r * 0.2;
+            }
+            if (t.look == 1u) {
+                // Spray bottle: body plus a nozzle toward its aim.
+                let nozzle = segment_sd(w, t.pos, t.pos + t.dir * r * 1.5) - r * 0.25;
+                sd = min(sd, nozzle);
+            }
+            let fill = 1.0 - smoothstep(-px, px, sd);
+            let rim = 1.0 - smoothstep(0.0, 0.1 + px, abs(sd));
+            out = over(out, linear(body_col), fill * 0.95);
+            out = over(out, linear(vec3f(0.08, 0.06, 0.05)), rim);
+            if (t.look == 3u) {
+                // The Cleaner's face: two angry eyes facing its aim.
+                let side = vec2f(t.dir.y, -t.dir.x);
+                let eye = min(length(w - (t.pos + t.dir * r * 0.35 + side * r * 0.35)),
+                              length(w - (t.pos + t.dir * r * 0.35 - side * r * 0.35)));
+                out = over(out, linear(vec3f(1.0)), 1.0 - smoothstep(r * 0.16 - px, r * 0.16 + px, eye));
+            }
+            // Health ring.
+            let ring_r = r + 0.9;
+            let ring = 1.0 - smoothstep(0.0, 0.12 + px, abs(len - ring_r));
+            let ang = atan2(d.x, d.y) / 6.2831853 + 0.5;
+            let lit = step(ang, t.health);
+            out = over(out, linear(mix(vec3f(0.3, 0.1, 0.1), vec3f(1.0, 0.25, 0.2), lit)), ring * 0.9);
         }
     }
 

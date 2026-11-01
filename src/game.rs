@@ -24,6 +24,8 @@ pub struct Controls {
     pub build: bool,
     /// Where the player is aiming, for Forms (world space), if anywhere.
     pub aim: Option<Vec2>,
+    /// Start / confirm pressed (edge-triggered).
+    pub start: bool,
 }
 
 impl Controls {
@@ -33,6 +35,7 @@ impl Controls {
         Self {
             form: [false; 2],
             cycle: [false; 2],
+            start: false,
             ..*self
         }
     }
@@ -52,6 +55,8 @@ pub struct Game {
     pub swarm_center: Option<Vec2>,
     /// Radius the swarm occupies at rest.
     pub swarm_radius: f32,
+    /// Extra camera pull-back (act transitions).
+    pub zoom_scale: f32,
 }
 
 /// How far beyond the swarm's edge the focal point may stray. Keeps the swarm
@@ -69,6 +74,7 @@ impl Game {
             agent_size: 0.45,
             swarm_center: None,
             swarm_radius: 0.0,
+            zoom_scale: 1.0,
         }
     }
 
@@ -121,8 +127,11 @@ impl Game {
 
     /// Eases the camera toward its target and the zoom for `count` critters.
     pub fn update_camera(&mut self, count: u32, dt: f32) {
-        self.camera
-            .follow(self.camera_target(), zoom_for_count(count), dt);
+        self.camera.follow(
+            self.camera_target(),
+            zoom_for_count(count) * self.zoom_scale,
+            dt,
+        );
     }
 
     pub fn camera_uniform(

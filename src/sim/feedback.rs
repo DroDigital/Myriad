@@ -44,6 +44,10 @@ pub struct SwarmSummary {
     pub died_total: u32,
     /// Cumulative critters spent on Forms.
     pub sacrificed_total: u32,
+    /// Cumulative agents folded into neighbours (act transitions).
+    pub merged_total: u32,
+    /// Cumulative contact damage per threat slot (`HIT_SCALE` per hp).
+    pub enemy_hits: [u32; super::MAX_THREATS],
     /// Step number this summary was taken at.
     pub step: u64,
 }
@@ -76,6 +80,8 @@ impl SwarmSummary {
             eaten_total: c(counter::EATEN),
             died_total: c(counter::DIED),
             sacrificed_total: c(counter::SACRIFICED),
+            merged_total: c(counter::MERGED),
+            enemy_hits: std::array::from_fn(|i| c(counter::ENEMY_HITS + i)),
             step,
         }
     }

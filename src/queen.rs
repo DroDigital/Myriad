@@ -12,6 +12,9 @@ pub const LAST_STAND_SECS: f32 = 3.0;
 pub const LAST_STAND_TOLERANCE: f32 = 10.0;
 /// Health she recovers to after surviving a last stand.
 pub const LAST_STAND_RECOVERY: f32 = 25.0;
+/// Health per second she regains after going unhurt for [`REGEN_DELAY`].
+pub const REGEN_RATE: f32 = 3.0;
+pub const REGEN_DELAY: f32 = 4.0;
 /// Her top speed as a fraction of the swarm's: she lags behind the action.
 pub const SPEED_FACTOR: f32 = 0.6;
 
@@ -35,6 +38,8 @@ pub struct Queen {
     pub state: QueenState,
     /// 1 right after taking damage, fading to 0 (for rendering).
     pub hurt_flash: f32,
+    /// Seconds since she was last hurt.
+    pub since_hurt: f32,
 }
 
 impl Queen {
@@ -45,6 +50,7 @@ impl Queen {
             health: MAX_HEALTH,
             state: QueenState::Healthy,
             hurt_flash: 0.0,
+            since_hurt: 0.0,
         }
     }
 
@@ -62,6 +68,10 @@ impl Queen {
         is_wall: impl Fn(Vec2) -> bool,
     ) {
         self.hurt_flash = (self.hurt_flash - dt * 3.0).max(0.0);
+        self.since_hurt += dt;
+        if self.state == QueenState::Healthy && self.since_hurt >= REGEN_DELAY {
+            self.health = (self.health + REGEN_RATE * dt).min(MAX_HEALTH);
+        }
         if let QueenState::LastStand { remaining, taken } = self.state {
             let remaining = remaining - dt;
             self.state = if remaining <= 0.0 {
@@ -98,6 +108,7 @@ impl Queen {
             return;
         }
         self.hurt_flash = 1.0;
+        self.since_hurt = 0.0;
         match self.state {
             QueenState::Healthy => {
                 self.health -= amount;
@@ -155,6 +166,20 @@ mod tests {
         }
         assert_eq!(q.state, QueenState::Healthy);
         assert_eq!(q.health, LAST_STAND_RECOVERY);
+    }
+
+    #[test]
+    fn regenerates_after_a_quiet_spell() {
+        let mut q = Queen::new(Vec2::ZERO);
+        q.damage(50.0);
+        for _ in 0..(REGEN_DELAY / DT) as usize - 1 {
+            q.update(None, 1.0, DT, |_| false);
+        }
+        assert_eq!(q.health, 50.0, "no regen straight after a hit");
+        for _ in 0..(5.0 / DT) as usize {
+            q.update(None, 1.0, DT, |_| false);
+        }
+        assert!(q.health > 60.0 && q.health <= MAX_HEALTH);
     }
 
     #[test]
