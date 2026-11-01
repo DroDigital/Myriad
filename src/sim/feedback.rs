@@ -52,8 +52,7 @@ impl SwarmSummary {
     pub fn parse(counters: &[u32], partials: &[[f32; 4]], step: u64) -> Self {
         let mut sum = DVec2::ZERO;
         let (mut body, mut alive, mut near) = (0.0f64, 0.0f64, 0.0f64);
-        for pair in partials.chunks_exact(2) {
-            let (a, b) = (pair[0], pair[1]);
+        for [a, b] in partials.as_chunks::<2>().0 {
             sum += DVec2::new(a[0] as f64, a[1] as f64);
             body += a[2] as f64;
             alive += a[3] as f64;
