@@ -243,6 +243,40 @@ fn eating_conserves_food_exactly() {
 }
 
 #[test]
+fn critters_pressed_against_solid_food_keep_eating_through_it() {
+    let Some(gpu) = gpu() else { return };
+    let mut layout = MaterialLayout::empty(bounds());
+    // A thick bread wall spanning the world's height: no way around it.
+    layout.fill_rect(
+        Vec2::new(4.0, -40.0),
+        Vec2::new(16.0, 40.0),
+        Kind::Bread,
+        FULL,
+    );
+    let mut rng = SplitMix64::new(12);
+    let agents = spawn_disk(Vec2::new(-4.0, 0.0), 600, 0.5, &mut rng);
+    let (mut swarm, _material) = swarm_on(&gpu, &layout, &agents, 1_024);
+    let focal = Vec2::new(30.0, 0.0);
+    let eaten_by = |swarm: &Swarm| swarm.read_counters(&gpu).unwrap()[counter::EATEN];
+    for step in 0..300 {
+        swarm.step(&gpu, &frame(focal, step));
+    }
+    // Once the swarm is pressed flat against the wall it must keep eating,
+    // not bounce off and stall.
+    let before = eaten_by(&swarm);
+    for step in 300..900 {
+        swarm.step(&gpu, &frame(focal, step));
+    }
+    let gnawed_cells = (eaten_by(&swarm) - before) as f32 / FULL as f32;
+    assert!(
+        // Biting along the bounced-back velocity managed ~30 here; biting the
+        // cell actually bumped into manages ~650.
+        gnawed_cells > 200.0,
+        "only {gnawed_cells:.1} cells eaten in 10 s against the wall"
+    );
+}
+
+#[test]
 fn critters_never_enter_walls() {
     let Some(gpu) = gpu() else { return };
     let mut layout = MaterialLayout::empty(bounds());

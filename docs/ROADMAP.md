@@ -53,7 +53,7 @@ Deferred to later steps: gamepad (Step 3), on-screen HUD text (Step 2), and per-
 - **The Queen** (`queen.rs`) follows the main body at 60% speed. Hatchlings appear around her, and nearby critters cut the damage she takes. At zero health she gets a 3-second last stand; then the run is lost and **R** restarts it.
 - **The mop** (`hazard.rs`) is a placeholder hazard that patrols a route, wipes out critters and hurts the Queen.
 - **Rendering**: smooth food blobs that shrink as they're eaten, an overlay layer for the Queen (beacon and health ring) and the mop, and a HUD from a built-in 5x7 bitmap font.
-- **Headless**: a scripted player tours the food, waiting to arrive and leaving once eating dries up. From 10 critters it reaches about 365 in 2 minutes and about 1,570 in 3 (26% of the kitchen eaten).
+- **Headless**: a scripted player tours the food, waiting to arrive and leaving once eating dries up. From 10 critters it reaches about 3,160 in 3 minutes (52% of the kitchen eaten).
 
 Deferred:
 - **Pathfinding.** Critters steer in straight lines, so some get stuck behind obstacles (bread, cupboards) until they eat through. This is now the first item of Step 3.

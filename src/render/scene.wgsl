@@ -94,16 +94,23 @@ fn mat_index(c: vec2i) -> u32 {
     return u32(cc.y) * cam.mat_dim.x + u32(cc.x);
 }
 
-// How much of kind `k` is at cell `c`, 0..1 (walls count as 1).
+// How much of kind `k` is at cell `c`, 0..1. Walls count as 1, and so does
+// any solid food that still has something left: it blocks movement until it is
+// completely gone, so it must stay visible until then.
 fn coverage(c: vec2i, k: u32) -> f32 {
     let i = mat_index(c);
     if (mat_kind[i] != k) {
         return 0.0;
     }
-    if ((kind_flags(k) & FLAG_BLOCKED) != 0u) {
+    let flags = kind_flags(k);
+    if ((flags & FLAG_BLOCKED) != 0u) {
         return 1.0;
     }
-    return min(f32(mat_amount[i]) / f32(FULL), 1.0);
+    let amount = mat_amount[i];
+    if ((flags & FLAG_SOLID) != 0u) {
+        return select(0.0, 1.0, amount > 0u);
+    }
+    return min(f32(amount) / f32(FULL), 1.0);
 }
 
 // Draws walls and food over the floor colour `base`. Food is a smooth blob
@@ -131,8 +138,15 @@ fn draw_material(w: vec2f, px: f32, base: vec3f) -> vec3f {
         // Cupboards and table legs: wood with a darker rim.
         let grain = 0.92 + 0.08 * sin(w.y * 3.0 + sin(w.x * 0.7) * 2.0);
         food *= grain * mix(0.7, 1.0, smoothstep(0.5, 0.95, cov));
+    } else if ((flags & FLAG_SOLID) != 0u) {
+        // Solid food keeps its shape until a cell is gone; gnawed cells darken.
+        let fullness = min(f32(mat_amount[mat_index(here)]) / f32(FULL), 1.0);
+        food *= mix(0.55, 1.05, fullness);
+        let gx = (c10 - c00) + (c11 - c01);
+        let gy = (c01 - c00) + (c11 - c10);
+        food *= 1.0 + 0.12 * clamp(gx - gy, -1.0, 1.0);
     } else {
-        // Thicker food reads brighter; solids get a shaded rim.
+        // Thicker food reads brighter.
         food *= mix(0.72, 1.05, smoothstep(0.45, 1.0, cov));
         let gx = (c10 - c00) + (c11 - c01);
         let gy = (c01 - c00) + (c11 - c10);

@@ -382,8 +382,13 @@ fn simulate(i: u32) -> vec2u {
     // Move, sliding along walls and uneaten solids. A critter already inside
     // something (e.g. hatched over it) may move freely so it can get out.
     let old = a.pos;
-    var np = old + a.vel * params.dt;
+    // Where the critter tried to go, before collision bounces its velocity.
+    let intended = a.vel;
+    let attempted = old + intended * params.dt;
+    var np = attempted;
+    var collided = false;
     if (blocked(np) && !blocked(old)) {
+        collided = true;
         let px = vec2f(np.x, old.y);
         let py = vec2f(old.x, np.y);
         if (!blocked(px)) {
@@ -411,18 +416,26 @@ fn simulate(i: u32) -> vec2u {
             eaten += bite(here, bite_size(k));
         }
     }
-    var heading = a.vel;
-    if (length(heading) < 1e-3) {
-        heading = to_focal;
+    // Solid food: bite the cell it just bumped into, or else the one just
+    // ahead along the direction it was trying to go (never the bounced-back
+    // velocity, which would point away from the food it is pressed against).
+    var gnaw = -1;
+    if (collided) {
+        gnaw = mat_cell(attempted);
+    } else {
+        var heading = intended;
+        if (length(heading) < 1e-3) {
+            heading = to_focal;
+        }
+        if (length(heading) > 1e-4) {
+            gnaw = mat_cell(np + normalize(heading) * params.mat_cell * 0.9);
+        }
     }
-    if (length(heading) > 1e-4) {
-        let ahead = mat_cell(np + normalize(heading) * params.mat_cell * 0.9);
-        if (ahead >= 0 && ahead != here) {
-            let k = mat_kind[ahead];
-            let f = kind_flags(k);
-            if ((f & FLAG_EDIBLE) != 0u && (f & FLAG_SOLID) != 0u) {
-                eaten += bite(ahead, bite_size(k));
-            }
+    if (gnaw >= 0 && gnaw != here) {
+        let k = mat_kind[gnaw];
+        let f = kind_flags(k);
+        if ((f & FLAG_EDIBLE) != 0u && (f & FLAG_SOLID) != 0u) {
+            eaten += bite(gnaw, bite_size(k));
         }
     }
 
